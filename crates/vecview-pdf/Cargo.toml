@@ -1,0 +1,8 @@
+[package]
+name = "vecview-pdf"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vecview-core = { path = "../vecview-core" }
+anyhow.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "vecview-renderer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vecview-core = { path = "../vecview-core" }
+lyon.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+anyhow.workspace = true

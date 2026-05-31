@@ -1,0 +1,9 @@
+[package]
+name = "vecview-svg"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vecview-core = { path = "../vecview-core" }
+usvg.workspace = true
+anyhow.workspace = true
