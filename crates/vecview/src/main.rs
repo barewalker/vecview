@@ -127,6 +127,11 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // 診断モード：VECVIEW_PROBE=1 で端末が報告するサイズを表示して終了する（解像度調査用）。
+    if std::env::var_os("VECVIEW_PROBE").is_some() {
+        probe_and_exit(args.backend.as_deref());
+    }
+
     if !args.file.exists() {
         bail!("ファイルが見つかりません: {}", args.file.display());
     }
@@ -172,7 +177,9 @@ fn main() -> Result<()> {
         renderer.adapter_info,
         source.watch_dir().display()
     );
-    eprintln!("操作: +/- ズーム  0 リセット  j/Space 次  k 前  q 終了");
+    eprintln!(
+        "操作: +/- ズーム  0 リセット  n/Space/PgDn 次頁  p/PgUp 前頁  hjkl/矢印 パン  q 終了"
+    );
 
     // ファイル監視（親ディレクトリを NonRecursive で監視し atomic rename を取りこぼさない）。
     // 対象ソースのページファイル以外の変更（temp_dir のノイズ等）は無視する。
@@ -470,23 +477,72 @@ fn render_and_display(
     Ok(())
 }
 
-/// バックエンドの表示可能領域（ピクセル）を求める。
+/// ラスタ化する解像度（ピクセル）を求める。
+///
+/// tmux プレースホルダ配置では端末がピクセル寸法を報告せず（width/height=0）、セル数 ×
+/// 概算セルサイズ(8x16) に頼るしかない。実セルサイズが概算より大きい環境（HiDPI 等）では
+/// この低解像度のまま端末側で引き伸ばされてボケる。そこでプレースホルダ時のみ高解像度で
+/// ラスタ化し、端末側の縮小でシャープにする（スーパーサンプリング）。倍率は VECVIEW_SCALE
+/// （既定2、1..=4）。直接配置(a=T)やフレームバッファはネイティブ画素表示なので等倍に保つ。
 fn available_area(backend_name: &str) -> (u32, u32) {
     if backend_name.starts_with("framebuffer") {
         if let Some(sz) = read_fb_virtual_size() {
             return sz;
         }
     }
+    // 画像が cols×rows セルへ縮小配置されるプレースホルダ時のみ過剰描画してよい。
+    let ss = if backend_name.contains("placeholder") {
+        supersample_factor()
+    } else {
+        1
+    };
     // 端末のピクセルサイズ（取得できなければセル数から概算、最後は固定値）。
     if let Ok(ws) = crossterm::terminal::window_size() {
         if ws.width > 0 && ws.height > 0 {
             return (ws.width as u32, ws.height as u32);
         }
         if ws.columns > 0 && ws.rows > 0 {
-            return (ws.columns as u32 * 8, ws.rows as u32 * 16);
+            return (ws.columns as u32 * 8 * ss, ws.rows as u32 * 16 * ss);
         }
     }
-    (1280, 800)
+    (1280 * ss, 800 * ss)
+}
+
+/// スーパーサンプリング倍率（環境変数 VECVIEW_SCALE、既定2、1..=4 にクランプ）。
+fn supersample_factor() -> u32 {
+    std::env::var("VECVIEW_SCALE")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(2)
+        .clamp(1, 4)
+}
+
+/// 端末が報告するサイズと、そこから算出する描画解像度を表示して終了する（解像度調査用）。
+fn probe_and_exit(backend: Option<&str>) -> ! {
+    let b = detect_backend(backend);
+    println!("backend            = {}", b.name());
+    println!("TMUX env           = {}", std::env::var_os("TMUX").is_some());
+    match crossterm::terminal::window_size() {
+        Ok(ws) => {
+            println!(
+                "window_size        = columns={} rows={} width(px)={} height(px)={}",
+                ws.columns, ws.rows, ws.width, ws.height
+            );
+            if ws.columns > 0 && ws.rows > 0 && ws.width > 0 && ws.height > 0 {
+                println!(
+                    "cell size(px)      = {} x {}",
+                    ws.width as u32 / ws.columns as u32,
+                    ws.height as u32 / ws.rows as u32
+                );
+            } else {
+                println!("cell size(px)      = 不明（ピクセル値が0 → 8x16 概算に落ちる）");
+            }
+        }
+        Err(e) => println!("window_size        = エラー: {e}"),
+    }
+    let (w, h) = available_area(b.name());
+    println!("available_area(px) = {w} x {h}  ← この解像度でラスタ化している");
+    std::process::exit(0);
 }
 
 fn read_fb_virtual_size() -> Option<(u32, u32)> {

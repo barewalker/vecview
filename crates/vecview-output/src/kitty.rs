@@ -13,7 +13,17 @@ use std::io::Write;
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 use vecview_core::OutputBackend;
+
+/// RGBA を zlib（RFC 1950）で圧縮する。kitty graphics の `o=z` で送る前段。圧縮レベルは
+/// 速度優先（白背景中心のページは低レベルでも十分縮む）。Vec への書き込みは失敗しない。
+fn zlib_compress(data: &[u8]) -> Vec<u8> {
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
+    let _ = enc.write_all(data);
+    enc.finish().unwrap_or_default()
+}
 
 /// base64 ペイロードの1チャンク最大長（Kitty 推奨の 4096 バイト）。
 const CHUNK: usize = 4096;
@@ -63,7 +73,9 @@ impl KittyBackend {
     /// 画像データを 4096 バイト区切りで転送する。`first_control` は先頭チャンクに付ける
     /// 制御キー列（例: `a=T,f=32,s=W,v=H`）。
     fn transmit(&self, out: &mut impl Write, rgba: &[u8], first_control: &str) -> std::io::Result<()> {
-        let payload = STANDARD.encode(rgba);
+        // RGBA は大半が同色（白背景）になりがちなので zlib 圧縮（o=z）が劇的に効く。
+        // s/v（画素寸法）は非圧縮サイズのまま。tmux passthrough 経由の転送量を大きく削減する。
+        let payload = STANDARD.encode(zlib_compress(rgba));
         let bytes = payload.as_bytes();
         let chunks: Vec<&[u8]> = bytes.chunks(CHUNK).collect();
         let last = chunks.len().saturating_sub(1);
@@ -71,7 +83,7 @@ impl KittyBackend {
             let more = if i == last { 0 } else { 1 };
             let mut body = Vec::new();
             if i == 0 {
-                write!(body, "_G{first_control},m={more};")?;
+                write!(body, "_G{first_control},o=z,m={more};")?;
             } else {
                 write!(body, "_Gm={more};")?;
             }
