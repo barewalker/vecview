@@ -2330,6 +2330,7 @@ dependencies = [
  "notify-debouncer-full",
  "vecview-core",
  "vecview-output",
+ "vecview-pdf",
  "vecview-renderer",
  "vecview-svg",
 ]
@@ -2359,7 +2360,6 @@ name = "vecview-pdf"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "vecview-core",
 ]
 
 [[package]]

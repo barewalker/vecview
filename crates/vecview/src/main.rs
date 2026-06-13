@@ -1,8 +1,9 @@
 //! vecview CLI エントリポイント。
 //!
-//! `vecview <FILE>` で SVG / Typst をターミナル内にベクター表示する。Typst（`.typ`）は
+//! `vecview <FILE>` で SVG / Typst / PDF をターミナル内にベクター表示する。Typst（`.typ`）は
 //! 内部で `typst watch` を起動して SVG を生成し、その SVG を監視してライブ再描画する。
-//! ブラウザ不要・ターミナル内完結の Typst プレビューを実現する。
+//! PDF（`.pdf`）は `pdftocairo` でページごとに SVG へ変換し、元 PDF を監視して保存のたびに
+//! 再変換する。いずれもブラウザ不要・ターミナル内完結のベクタープレビューを実現する。
 //!
 //! 端末（TTY）で起動するとインタラクティブモードになり、キーでズーム・ページ送り・終了できる。
 
@@ -38,6 +39,13 @@ enum Source {
     Svg(PathBuf),
     /// Typst（`typst watch` が `vecview-<stem>-<p>.svg` をページごとに出力）。
     Typst { dir: PathBuf, stem: String },
+    /// PDF（`pdftocairo` が `vecview-<stem>-<p>.svg` をページごとに生成。元 PDF を監視し
+    /// 保存のたび全ページ再変換する）。
+    Pdf {
+        pdf: PathBuf,
+        dir: PathBuf,
+        stem: String,
+    },
 }
 
 impl Source {
@@ -45,15 +53,17 @@ impl Source {
     fn page_path(&self, idx: usize) -> PathBuf {
         match self {
             Source::Svg(p) => p.clone(),
-            Source::Typst { dir, stem } => dir.join(format!("vecview-{stem}-{}.svg", idx + 1)),
+            Source::Typst { dir, stem } | Source::Pdf { dir, stem, .. } => {
+                dir.join(format!("vecview-{stem}-{}.svg", idx + 1))
+            }
         }
     }
 
-    /// 現在存在するページ数（Typst は連番ファイルを数える）。最低 1。
+    /// 現在存在するページ数（Typst/PDF は連番ファイルを数える）。最低 1。
     fn page_count(&self) -> usize {
         match self {
             Source::Svg(_) => 1,
-            Source::Typst { dir, stem } => {
+            Source::Typst { dir, stem } | Source::Pdf { dir, stem, .. } => {
                 let mut n = 0;
                 while dir.join(format!("vecview-{stem}-{}.svg", n + 1)).exists() {
                     n += 1;
@@ -63,20 +73,22 @@ impl Source {
         }
     }
 
-    /// 監視すべきディレクトリ。
+    /// 監視すべきディレクトリ。Typst は生成先、PDF/SVG は元ファイルのあるディレクトリ。
     fn watch_dir(&self) -> PathBuf {
         let base = match self {
             Source::Svg(p) => p.parent().map(Path::to_path_buf),
             Source::Typst { dir, .. } => Some(dir.clone()),
+            Source::Pdf { pdf, .. } => pdf.parent().map(Path::to_path_buf),
         };
         base.filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
-    /// 変更パスがこのソースのページファイルか。
+    /// 変更パスがこのソースの監視対象（ページファイル、または元 PDF）か。
     fn owns(&self, path: &Path) -> bool {
         match self {
             Source::Svg(p) => path == p,
+            Source::Pdf { pdf, .. } => path == pdf,
             Source::Typst { dir, stem } => {
                 path.parent() == Some(dir.as_path())
                     && path
@@ -87,12 +99,20 @@ impl Source {
             }
         }
     }
+
+    /// 監視対象が変化したときの再生成。PDF は元ファイルを全ページ再変換する。
+    fn reconvert(&self) -> Result<()> {
+        if let Source::Pdf { pdf, dir, stem } = self {
+            vecview_pdf::convert_to_svgs(pdf, dir, stem)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Parser, Debug)]
 #[command(name = "vecview", version, about = "ベクターグラフィクスをターミナルに表示する")]
 struct Args {
-    /// 表示するファイル（SVG または Typst .typ）。
+    /// 表示するファイル（SVG / Typst .typ / PDF）。
     file: PathBuf,
 
     /// 初期ズーム倍率（%）。
@@ -128,7 +148,20 @@ fn main() -> Result<()> {
             let canonical = std::fs::canonicalize(&args.file).unwrap_or_else(|_| args.file.clone());
             (Source::Svg(canonical), None)
         }
-        other => bail!("未対応の拡張子です: .{other}（svg / typ のみ対応）"),
+        // PDF は起動時に全ページを SVG 化（typst のような常駐ウォッチャは不要。元 PDF の
+        // 変更は下のファイル監視で検知して再変換する）。
+        "pdf" => {
+            let canonical = std::fs::canonicalize(&args.file).unwrap_or_else(|_| args.file.clone());
+            let stem = canonical
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("vecview")
+                .to_string();
+            let dir = std::env::temp_dir();
+            vecview_pdf::convert_to_svgs(&canonical, &dir, &stem).context("PDF の変換")?;
+            (Source::Pdf { pdf: canonical, dir, stem }, None)
+        }
+        other => bail!("未対応の拡張子です: .{other}（svg / typ / pdf のみ対応）"),
     };
 
     let backend = detect_backend(args.backend.as_deref());
@@ -226,6 +259,21 @@ fn main() -> Result<()> {
                 }
             }
             Msg::Reload => {
+                // PDF は元ファイルが変わったので全ページを再変換してから描画する。
+                // 監視対象（元 PDF）と描画対象（temp の SVG）が別なので自己トリガーは起きない。
+                if matches!(source, Source::Pdf { .. }) {
+                    if let Err(e) = source.reconvert() {
+                        eprintln!("vecview: PDF 再変換エラー: {e:#}");
+                        continue;
+                    }
+                    let pc = source.page_count();
+                    if state.page >= pc {
+                        state.page = pc - 1;
+                        state.center = None;
+                    }
+                    render_current(&source, &mut state, &renderer, backend.as_ref(), &mut last_render);
+                    continue;
+                }
                 let path = source.page_path(state.page);
                 let current = mtime_of(&path);
                 if current.is_none() || (last_render.map(|(p, _)| p) == Some(state.page)

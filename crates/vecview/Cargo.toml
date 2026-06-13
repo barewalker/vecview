@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 vecview-core = { path = "../vecview-core" }
+vecview-pdf = { path = "../vecview-pdf" }
 vecview-svg = { path = "../vecview-svg" }
 vecview-renderer = { path = "../vecview-renderer" }
 vecview-output = { path = "../vecview-output" }
