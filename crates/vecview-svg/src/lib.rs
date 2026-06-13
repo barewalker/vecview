@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 use vecview_core::{
-    Color, Document, DrawCommand, Fill, FillRule, Page, PathData, PathSegment, Stroke,
+    Color, Document, DrawCommand, Fill, FillRule, ImageData, Page, PathData, PathSegment, Stroke,
 };
 
 pub struct SvgDocument {
@@ -59,10 +59,43 @@ fn walk(group: &usvg::Group, out: &mut Vec<DrawCommand>) {
                     out.push(DrawCommand::Path(path));
                 }
             }
-            // 画像・テキストは初回スコープ外（Typst SVG では文字は Path として来る）。
-            usvg::Node::Image(_) | usvg::Node::Text(_) => {}
+            // 埋め込みラスター画像（PDF 内のビットマップ図など）をデコードして取り込む。
+            // 親グループのソフトマスク/クリップは未対応（当面無視）。
+            usvg::Node::Image(img) => {
+                if let Some(image) = convert_image(img) {
+                    out.push(DrawCommand::Image(image));
+                }
+            }
+            // テキストは初回スコープ外（Typst/PDF の SVG では文字は Path 化されて来る）。
+            usvg::Node::Text(_) => {}
         }
     }
+}
+
+/// `<image>` ノードを [`ImageData`] に変換する。配置矩形は絶対座標の外接矩形
+/// （`abs_bounding_box`）を使う。pdftocairo の画像は軸平行なのでこれで一致する。
+/// 埋め込みデータ（PNG/JPEG/GIF/WebP）は `image` クレートで RGBA8 にデコードする。
+fn convert_image(img: &usvg::Image) -> Option<ImageData> {
+    if !img.is_visible() {
+        return None;
+    }
+    let bytes: &[u8] = match img.kind() {
+        usvg::ImageKind::JPEG(d)
+        | usvg::ImageKind::PNG(d)
+        | usvg::ImageKind::GIF(d)
+        | usvg::ImageKind::WEBP(d) => d,
+        // ネストされた SVG 画像は別途ベクター描画が必要なため当面未対応。
+        usvg::ImageKind::SVG(_) => return None,
+    };
+    let decoded = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (px_width, px_height) = decoded.dimensions();
+    let bbox = img.abs_bounding_box();
+    Some(ImageData {
+        rgba: decoded.into_raw(),
+        px_width,
+        px_height,
+        rect: [bbox.x(), bbox.y(), bbox.width(), bbox.height()],
+    })
 }
 
 fn convert_path(path: &usvg::Path) -> Option<PathData> {

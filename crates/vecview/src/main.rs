@@ -17,7 +17,7 @@ use clap::Parser;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use notify_debouncer_full::notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
-use vecview_core::{Document, OutputBackend};
+use vecview_core::{Document, DrawCommand, OutputBackend, Page, PathSegment};
 use vecview_output::detect_backend;
 use vecview_renderer::Renderer;
 use vecview_svg::SvgDocument;
@@ -122,14 +122,20 @@ struct Args {
     /// 出力バックエンド強制指定 [kitty|tmux|framebuffer]。
     #[arg(short, long)]
     backend: Option<String>,
+
+    /// スーパーサンプリング倍率（1..=4）。tmux 表示のシャープさと引き換えに転送量が増える。
+    /// 未指定なら環境変数 VECVIEW_SCALE、それも無ければ 2。
+    #[arg(short, long)]
+    scale: Option<u32>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let scale = resolve_scale(args.scale);
 
     // 診断モード：VECVIEW_PROBE=1 で端末が報告するサイズを表示して終了する（解像度調査用）。
     if std::env::var_os("VECVIEW_PROBE").is_some() {
-        probe_and_exit(args.backend.as_deref());
+        probe_and_exit(args.backend.as_deref(), scale);
     }
 
     if !args.file.exists() {
@@ -178,7 +184,8 @@ fn main() -> Result<()> {
         source.watch_dir().display()
     );
     eprintln!(
-        "操作: +/- ズーム  0 リセット  n/Space/PgDn 次頁  p/PgUp 前頁  hjkl/矢印 パン  q 終了"
+        "操作: +/- ズーム  0 リセット  w 左右フィット  v 上下フィット  \
+         n/Space/PgDn 次頁  p/PgUp 前頁  hjkl/矢印 パン  q 終了"
     );
 
     // ファイル監視（親ディレクトリを NonRecursive で監視し atomic rename を取りこぼさない）。
@@ -187,7 +194,7 @@ fn main() -> Result<()> {
     let watch_tx = tx.clone();
     let owns_source = source.clone();
     let mut debouncer = new_debouncer(
-        Duration::from_millis(120),
+        Duration::from_millis(200),
         None,
         move |res: DebounceEventResult| {
             if let Ok(events) = res {
@@ -235,6 +242,8 @@ fn main() -> Result<()> {
         center: None,
         last_vw: 0.0,
         last_vh: 0.0,
+        scale,
+        pending_fit: None,
     };
     // 最後に描画した (ページ, mtime)。描画のたびに SVG を読むと atime が変わり notify が
     // 再発火する（自己トリガー）ため、同一ページで mtime 不変なら描画しない。
@@ -243,53 +252,81 @@ fn main() -> Result<()> {
     // 初回描画（.typ は生成待ちのため存在しないことがある）。
     render_current(&source, &mut state, &renderer, backend.as_ref(), &mut last_render);
 
-    while let Ok(msg) = rx.recv() {
-        match msg {
-            Msg::Quit => break,
-            Msg::Key(k) => {
-                if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                    continue;
+    while let Ok(first) = rx.recv() {
+        // バーストをまとめて取り出す。連続する Reload は1回の描画に集約し、Quit/キーが
+        // Reload の後ろに積まれても取りこぼさない（高頻度の再変換で反応不能・点滅になるのを防ぐ）。
+        let mut msgs = vec![first];
+        while let Ok(m) = rx.try_recv() {
+            msgs.push(m);
+        }
+
+        let mut quit = false;
+        let mut reload = false;
+        let mut dirty = false; // キー操作などで再描画が必要。
+
+        for m in msgs {
+            match m {
+                Msg::Quit => {
+                    quit = true;
+                    break;
                 }
-                match key_action(&k) {
-                    Some(Action::Quit) => break,
-                    Some(action) => {
-                        apply_action(action, &source, &mut state);
-                        render_current(
-                            &source,
-                            &mut state,
-                            &renderer,
-                            backend.as_ref(),
-                            &mut last_render,
-                        );
-                    }
-                    None => {}
-                }
-            }
-            Msg::Reload => {
-                // PDF は元ファイルが変わったので全ページを再変換してから描画する。
-                // 監視対象（元 PDF）と描画対象（temp の SVG）が別なので自己トリガーは起きない。
-                if matches!(source, Source::Pdf { .. }) {
-                    if let Err(e) = source.reconvert() {
-                        eprintln!("vecview: PDF 再変換エラー: {e:#}");
+                Msg::Key(k) => {
+                    if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                         continue;
                     }
-                    let pc = source.page_count();
-                    if state.page >= pc {
-                        state.page = pc - 1;
-                        state.center = None;
+                    match key_action(&k) {
+                        Some(Action::Quit) => {
+                            quit = true;
+                            break;
+                        }
+                        Some(action) => {
+                            apply_action(action, &source, &mut state);
+                            dirty = true;
+                        }
+                        None => {}
                     }
-                    render_current(&source, &mut state, &renderer, backend.as_ref(), &mut last_render);
-                    continue;
                 }
+                Msg::Reload => reload = true,
+            }
+        }
+
+        // Quit はバースト内の再変換・描画より優先（重い処理に入る前に抜ける）。
+        if quit {
+            break;
+        }
+
+        if reload {
+            if matches!(source, Source::Pdf { .. }) {
+                // PDF は元ファイルが変わったので全ページを再変換する（監視対象＝元 PDF、
+                // 描画対象＝temp の SVG なので自己トリガーは起きない）。
+                match source.reconvert() {
+                    Ok(()) => {
+                        let pc = source.page_count();
+                        if state.page >= pc {
+                            state.page = pc - 1;
+                            state.center = None;
+                        }
+                        dirty = true;
+                    }
+                    // 書き込み途中の PDF を読むと一時的に失敗する。次の Reload で取り直す。
+                    Err(e) => eprintln!("vecview: PDF 再変換エラー: {e:#}"),
+                }
+            } else {
+                // SVG/Typst は描画が atime を変えて notify が再発火する（自己トリガー）。
+                // 同一ページで mtime 不変なら描画しない。
                 let path = source.page_path(state.page);
                 let current = mtime_of(&path);
-                if current.is_none() || (last_render.map(|(p, _)| p) == Some(state.page)
-                    && current == last_render.map(|(_, m)| m))
-                {
-                    continue;
+                let unchanged = current.is_none()
+                    || (last_render.map(|(p, _)| p) == Some(state.page)
+                        && current == last_render.map(|(_, m)| m));
+                if !unchanged {
+                    dirty = true;
                 }
-                render_current(&source, &mut state, &renderer, backend.as_ref(), &mut last_render);
             }
+        }
+
+        if dirty {
+            render_current(&source, &mut state, &renderer, backend.as_ref(), &mut last_render);
         }
     }
 
@@ -314,6 +351,19 @@ struct ViewState {
     center: Option<(f32, f32)>,
     last_vw: f32,
     last_vh: f32,
+    /// スーパーサンプリング倍率（1..=4）。描画解像度に掛かる。
+    scale: u32,
+    /// 次回描画時に本文境界へフィットさせる要求（描画時に本文 bbox を見て zoom/center へ反映）。
+    pending_fit: Option<Fit>,
+}
+
+/// 本文（ink）境界へのフィット方向。
+#[derive(Clone, Copy)]
+enum Fit {
+    /// 本文の左右いっぱいに合わせる（横方向にフィット、縦ははみ出し可・パンで送る）。
+    Width,
+    /// 本文の上下いっぱいに合わせる（縦方向にフィット）。
+    Height,
 }
 
 /// キー操作。
@@ -326,6 +376,8 @@ enum Action {
     Pan(f32, f32),
     NextPage,
     PrevPage,
+    /// 本文境界へフィット（左右/上下）。
+    FitContent(Fit),
 }
 
 /// ズーム倍率（%）。最小はフィット(100)、最大は16倍。
@@ -341,6 +393,9 @@ fn key_action(k: &KeyEvent) -> Option<Action> {
         KeyCode::Char('+') | KeyCode::Char('=') => Some(Action::ZoomIn),
         KeyCode::Char('-') | KeyCode::Char('_') => Some(Action::ZoomOut),
         KeyCode::Char('0') => Some(Action::ZoomReset),
+        // 本文フィット。w=左右いっぱい、v=上下いっぱい。
+        KeyCode::Char('w') => Some(Action::FitContent(Fit::Width)),
+        KeyCode::Char('v') => Some(Action::FitContent(Fit::Height)),
         // パン（vim hjkl ＋ 矢印）。
         KeyCode::Char('h') | KeyCode::Left => Some(Action::Pan(-1.0, 0.0)),
         KeyCode::Char('l') | KeyCode::Right => Some(Action::Pan(1.0, 0.0)),
@@ -382,6 +437,9 @@ fn apply_action(action: Action, source: &Source, state: &mut ViewState) {
                 state.center = None;
             }
         }
+        // 本文 bbox は描画時にしか分からない（ページの SVG を読む必要がある）ため、要求だけ
+        // 立てておき、render_and_display で zoom/center に反映する。
+        Action::FitContent(fit) => state.pending_fit = Some(fit),
     }
 }
 
@@ -462,7 +520,14 @@ fn render_and_display(
     let ph = page.height.max(1.0);
 
     // 出力は常にペイン（表示領域）サイズ。ズームはビューポート矩形の大小で表現する。
-    let (out_w, out_h) = available_area(backend.name());
+    let (out_w, out_h) = available_area(backend.name(), state.scale);
+
+    // 本文フィット要求があれば、本文境界からズーム/中心を算出して通常のビューポート計算へ委譲。
+    if let Some(fit) = state.pending_fit.take() {
+        if let Some(bbox) = content_bbox(&page) {
+            apply_fit(fit, bbox, pw, ph, out_w, out_h, state);
+        }
+    }
 
     // 中心（未設定ならページ中央）からビューポートを計算（内部でページ内にクランプ）。
     let center = state.center.unwrap_or((pw / 2.0, ph / 2.0));
@@ -483,8 +548,8 @@ fn render_and_display(
 /// 概算セルサイズ(8x16) に頼るしかない。実セルサイズが概算より大きい環境（HiDPI 等）では
 /// この低解像度のまま端末側で引き伸ばされてボケる。そこでプレースホルダ時のみ高解像度で
 /// ラスタ化し、端末側の縮小でシャープにする（スーパーサンプリング）。倍率は VECVIEW_SCALE
-/// （既定2、1..=4）。直接配置(a=T)やフレームバッファはネイティブ画素表示なので等倍に保つ。
-fn available_area(backend_name: &str) -> (u32, u32) {
+/// （`scale`、既定2、1..=4）。直接配置(a=T)やフレームバッファはネイティブ画素表示なので等倍に保つ。
+fn available_area(backend_name: &str, scale: u32) -> (u32, u32) {
     if backend_name.starts_with("framebuffer") {
         if let Some(sz) = read_fb_virtual_size() {
             return sz;
@@ -492,7 +557,7 @@ fn available_area(backend_name: &str) -> (u32, u32) {
     }
     // 画像が cols×rows セルへ縮小配置されるプレースホルダ時のみ過剰描画してよい。
     let ss = if backend_name.contains("placeholder") {
-        supersample_factor()
+        scale
     } else {
         1
     };
@@ -508,19 +573,81 @@ fn available_area(backend_name: &str) -> (u32, u32) {
     (1280 * ss, 800 * ss)
 }
 
-/// スーパーサンプリング倍率（環境変数 VECVIEW_SCALE、既定2、1..=4 にクランプ）。
-fn supersample_factor() -> u32 {
-    std::env::var("VECVIEW_SCALE")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(2)
-        .clamp(1, 4)
+/// スーパーサンプリング倍率を決める。優先順位は CLI 引数 > 環境変数 VECVIEW_SCALE > 既定2。
+/// いずれも 1..=4 にクランプする。
+fn resolve_scale(arg: Option<u32>) -> u32 {
+    arg.or_else(|| {
+        std::env::var("VECVIEW_SCALE")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+    })
+    .unwrap_or(2)
+    .clamp(1, 4)
+}
+
+/// ページ内の全パス頂点（制御点含む）から本文（ink）の外接矩形 [x, y, w, h] を求める。
+/// pdftocairo の SVG は全面背景矩形を持たないため、これが実際の本文境界になる。可視パスが
+/// 無ければ None。制御点を含むため厳密な曲線境界よりわずかに広いが、フィット用途では十分。
+fn content_bbox(page: &Page) -> Option<[f32; 4]> {
+    let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
+    let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut acc = |[x, y]: [f32; 2]| {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    };
+    for cmd in &page.commands {
+        match cmd {
+            DrawCommand::Path(p) => {
+                for seg in &p.segments {
+                    match *seg {
+                        PathSegment::MoveTo(a) | PathSegment::LineTo(a) => acc(a),
+                        PathSegment::QuadTo(c, a) => {
+                            acc(c);
+                            acc(a);
+                        }
+                        PathSegment::CubicTo(c1, c2, a) => {
+                            acc(c1);
+                            acc(c2);
+                            acc(a);
+                        }
+                        PathSegment::Close => {}
+                    }
+                }
+            }
+            DrawCommand::Image(img) => {
+                let [x, y, w, h] = img.rect;
+                acc([x, y]);
+                acc([x + w, y + h]);
+            }
+        }
+    }
+    (min_x.is_finite() && max_x > min_x && max_y > min_y)
+        .then_some([min_x, min_y, max_x - min_x, max_y - min_y])
+}
+
+/// 本文境界 `bbox` に合わせて `state` の zoom/center を設定する。Width=左右いっぱい、
+/// Height=上下いっぱい。zoom はフィット倍率(s0=100%)に対する比として求め、範囲にクランプ。
+fn apply_fit(fit: Fit, bbox: [f32; 4], pw: f32, ph: f32, out_w: u32, out_h: u32, state: &mut ViewState) {
+    let [bx, by, bw, bh] = bbox;
+    let bw = bw.max(1.0);
+    let bh = bh.max(1.0);
+    let s0 = (out_w as f32 / pw).min(out_h as f32 / ph); // ページ全体フィット(=100%)の倍率。
+    let s = match fit {
+        Fit::Width => out_w as f32 / bw,
+        Fit::Height => out_h as f32 / bh,
+    };
+    let zoom = ((s / s0) * 100.0).round();
+    state.zoom = (zoom as i64).clamp(ZOOM_MIN as i64, ZOOM_MAX as i64) as u32;
+    state.center = Some((bx + bw / 2.0, by + bh / 2.0));
 }
 
 /// 端末が報告するサイズと、そこから算出する描画解像度を表示して終了する（解像度調査用）。
-fn probe_and_exit(backend: Option<&str>) -> ! {
+fn probe_and_exit(backend: Option<&str>, scale: u32) -> ! {
     let b = detect_backend(backend);
     println!("backend            = {}", b.name());
+    println!("scale (SS倍率)     = {scale}");
     println!("TMUX env           = {}", std::env::var_os("TMUX").is_some());
     match crossterm::terminal::window_size() {
         Ok(ws) => {
@@ -540,7 +667,7 @@ fn probe_and_exit(backend: Option<&str>) -> ! {
         }
         Err(e) => println!("window_size        = エラー: {e}"),
     }
-    let (w, h) = available_area(b.name());
+    let (w, h) = available_area(b.name(), scale);
     println!("available_area(px) = {w} x {h}  ← この解像度でラスタ化している");
     std::process::exit(0);
 }
@@ -588,7 +715,86 @@ fn clamp_origin(center: f32, v: f32, p: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::viewport_for;
+    use super::{apply_fit, content_bbox, resolve_scale, viewport_for, Fit, ViewState};
+    use vecview_core::{DrawCommand, Page, PathData, PathSegment};
+
+    fn path(segments: Vec<PathSegment>) -> DrawCommand {
+        DrawCommand::Path(PathData {
+            segments,
+            fill: None,
+            stroke: None,
+        })
+    }
+
+    fn state() -> ViewState {
+        ViewState {
+            page: 0,
+            zoom: 100,
+            center: None,
+            last_vw: 0.0,
+            last_vh: 0.0,
+            scale: 2,
+            pending_fit: None,
+        }
+    }
+
+    #[test]
+    fn content_bbox_spans_all_vertices() {
+        // 2本のパスの全頂点（制御点含む）を覆う外接矩形。
+        let page = Page {
+            width: 1000.0,
+            height: 1000.0,
+            commands: vec![
+                path(vec![
+                    PathSegment::MoveTo([200.0, 300.0]),
+                    PathSegment::LineTo([400.0, 300.0]),
+                ]),
+                path(vec![
+                    PathSegment::MoveTo([300.0, 400.0]),
+                    PathSegment::CubicTo([350.0, 450.0], [700.0, 500.0], [600.0, 700.0]),
+                ]),
+            ],
+        };
+        // x:200..700, y:300..700 → [200,300, 500,400]。
+        assert_eq!(content_bbox(&page), Some([200.0, 300.0, 500.0, 400.0]));
+    }
+
+    #[test]
+    fn content_bbox_empty_is_none() {
+        let page = Page {
+            width: 100.0,
+            height: 100.0,
+            commands: vec![],
+        };
+        assert_eq!(content_bbox(&page), None);
+    }
+
+    #[test]
+    fn fit_width_fills_output_width_and_centers_on_content() {
+        // ページ 1000x1000 を 1000x1000 出力へ（s0=1）。本文 [200,300,600,400]。
+        // 左右フィット: s=out_w/bw=1000/600=1.667 → zoom=167%、中心=本文中心(500,500)。
+        let mut s = state();
+        apply_fit(Fit::Width, [200.0, 300.0, 600.0, 400.0], 1000.0, 1000.0, 1000, 1000, &mut s);
+        assert_eq!(s.zoom, 167);
+        assert_eq!(s.center, Some((500.0, 500.0)));
+    }
+
+    #[test]
+    fn fit_height_fills_output_height() {
+        // 上下フィット: s=out_h/bh=1000/400=2.5 → zoom=250%、中心=本文中心。
+        let mut s = state();
+        apply_fit(Fit::Height, [200.0, 300.0, 600.0, 400.0], 1000.0, 1000.0, 1000, 1000, &mut s);
+        assert_eq!(s.zoom, 250);
+        assert_eq!(s.center, Some((500.0, 500.0)));
+    }
+
+    #[test]
+    fn scale_precedence_arg_over_env_with_clamp() {
+        // 引数が最優先。範囲外は 1..=4 にクランプ。
+        assert_eq!(resolve_scale(Some(3)), 3);
+        assert_eq!(resolve_scale(Some(9)), 4);
+        assert_eq!(resolve_scale(Some(0)), 1);
+    }
 
     #[test]
     fn fit_shows_whole_page_centered() {

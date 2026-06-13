@@ -33,6 +33,14 @@ struct Vertex {
     color: [f32; 4],
 }
 
+/// 画像（テクスチャ付き矩形）の頂点。位置はページ座標、uv はテクスチャ座標。
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ImageVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Uniforms {
@@ -69,6 +77,10 @@ pub struct Renderer {
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    /// 画像（テクスチャ付き矩形）描画用パイプラインとレイアウト・サンプラ。
+    image_pipeline: wgpu::RenderPipeline,
+    image_bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
     /// 選択されたアダプタ名（デバッグ表示用）。
     pub adapter_info: String,
 }
@@ -171,11 +183,97 @@ impl Renderer {
             cache: None,
         });
 
+        // 画像用：uniform(viewport, 頂点) + テクスチャ + サンプラ（フラグメント）。
+        let image_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("vecview-image-bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let image_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("vecview-image-pl"),
+                bind_group_layouts: &[Some(&image_bind_group_layout)],
+                immediate_size: 0,
+            });
+
+        let image_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("vecview-image-pipeline"),
+            layout: Some(&image_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_img"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<ImageVertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_img"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: TEXTURE_FORMAT,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: SAMPLE_COUNT,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("vecview-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+
         Ok(Self {
             device,
             queue,
             pipeline,
             bind_group_layout,
+            image_pipeline,
+            image_bind_group_layout,
+            sampler,
             adapter_info,
         })
     }
@@ -246,6 +344,10 @@ impl Renderer {
                 usage: wgpu::BufferUsages::INDEX,
             });
 
+        // 画像 GPU リソースをパス開始前に用意（テクスチャ・頂点・バインドグループ）。
+        // テクスチャはバインドグループが内部で参照を保持するが、念のため生存させておく。
+        let image_draws = self.prepare_images(page, &uniform_buf);
+
         // 読み戻しバッファ（256バイト行アライン必須）。
         let bytes_per_row = align_up(width * 4, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -286,6 +388,17 @@ impl Renderer {
                 pass.set_vertex_buffer(0, vertex_buf.slice(..));
                 pass.set_index_buffer(index_buf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..geometry.indices.len() as u32, 0, 0..1);
+            }
+
+            // ラスター画像をパスの上に合成する。z 順は「全パス→全画像」と単純化しており、
+            // ベクター注釈を画像の上に重ねる文書では前後関係が崩れる（PDF の図では実害なし）。
+            if !image_draws.is_empty() {
+                pass.set_pipeline(&self.image_pipeline);
+                for img in &image_draws {
+                    pass.set_bind_group(0, &img.bind_group, &[]);
+                    pass.set_vertex_buffer(0, img.vertices.slice(..));
+                    pass.draw(0..6, 0..1);
+                }
             }
         }
 
@@ -338,6 +451,83 @@ impl Renderer {
         Ok(out)
     }
 
+    /// ページ内の各画像について、テクスチャ・バインドグループ・頂点バッファを用意する。
+    /// `uniform_buf` は viewport（パスと共通の座標変換）。
+    fn prepare_images(&self, page: &Page, uniform_buf: &wgpu::Buffer) -> Vec<ImageDraw> {
+        let mut draws = Vec::new();
+        for cmd in &page.commands {
+            let DrawCommand::Image(img) = cmd else {
+                continue;
+            };
+            if img.px_width == 0 || img.px_height == 0 {
+                continue;
+            }
+            let size = wgpu::Extent3d {
+                width: img.px_width,
+                height: img.px_height,
+                depth_or_array_layers: 1,
+            };
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("vecview-image-texture"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            // write_texture は 256 バイト行アライン不要（copy_buffer_to_texture と違う）。
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &img.rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(img.px_width * 4),
+                    rows_per_image: Some(img.px_height),
+                },
+                size,
+            );
+            let view = texture.create_view(&Default::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("vecview-image-bg"),
+                layout: &self.image_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            let vertices = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("vecview-image-verts"),
+                    contents: bytemuck::cast_slice(&image_quad(img.rect)),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            draws.push(ImageDraw {
+                bind_group,
+                vertices,
+                _texture: texture,
+            });
+        }
+        draws
+    }
+
     fn create_texture(
         &self,
         width: u32,
@@ -362,7 +552,25 @@ impl Renderer {
     }
 }
 
-/// ページ内の全パスを1つの頂点/インデックスバッファにテッセレーションする。
+/// 1枚の画像を描くための GPU リソース束。`_texture` はバインドグループが内部参照を保持する
+/// ため直接は使わないが、明示的に生存させて安全側に倒す。
+struct ImageDraw {
+    bind_group: wgpu::BindGroup,
+    vertices: wgpu::Buffer,
+    _texture: wgpu::Texture,
+}
+
+/// ページ座標の矩形 [x, y, w, h] を、テクスチャ全体を貼る2三角形（6頂点）に展開する。
+fn image_quad(rect: [f32; 4]) -> [ImageVertex; 6] {
+    let [x, y, w, h] = rect;
+    let tl = ImageVertex { position: [x, y], uv: [0.0, 0.0] };
+    let tr = ImageVertex { position: [x + w, y], uv: [1.0, 0.0] };
+    let br = ImageVertex { position: [x + w, y + h], uv: [1.0, 1.0] };
+    let bl = ImageVertex { position: [x, y + h], uv: [0.0, 1.0] };
+    [tl, tr, br, tl, br, bl]
+}
+
+/// ページ内の全パスを1つの頂点/インデックスバッファにテッセレーションする（画像は別経路）。
 fn tessellate(page: &Page) -> Result<VertexBuffers<Vertex, u32>> {
     let mut buffers: VertexBuffers<Vertex, u32> = VertexBuffers::new();
     let mut fill_tess = FillTessellator::new();
@@ -390,7 +598,9 @@ fn tessellate(page: &Page) -> Result<VertexBuffers<Vertex, u32>> {
     }
 
     for cmd in &page.commands {
-        let DrawCommand::Path(path) = cmd;
+        let DrawCommand::Path(path) = cmd else {
+            continue; // 画像は prepare_images / image_pipeline で別途描く。
+        };
         let lyon_path = build_path(&path.segments);
 
         if let Some(fill) = &path.fill {
@@ -502,6 +712,32 @@ fn vs(@location(0) position: vec2<f32>, @location(1) color: vec4<f32>) -> VsOut 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     return in.color;
+}
+
+// --- 画像（テクスチャ付き矩形）---
+@group(0) @binding(1) var img_tex: texture_2d<f32>;
+@group(0) @binding(2) var img_samp: sampler;
+
+struct ImgOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_img(@location(0) position: vec2<f32>, @location(1) uv: vec2<f32>) -> ImgOut {
+    var out: ImgOut;
+    let ndc = vec2<f32>(
+        (position.x - u.viewport.x) / u.viewport.z * 2.0 - 1.0,
+        1.0 - (position.y - u.viewport.y) / u.viewport.w * 2.0,
+    );
+    out.pos = vec4<f32>(ndc, 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@fragment
+fn fs_img(in: ImgOut) -> @location(0) vec4<f32> {
+    return textureSample(img_tex, img_samp, in.uv);
 }
 "#;
 

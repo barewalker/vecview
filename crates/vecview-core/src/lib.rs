@@ -16,9 +16,23 @@ pub struct Page {
     pub commands: Vec<DrawCommand>,
 }
 
-/// 描画コマンド。初回スコープでは [`DrawCommand::Path`] のみ生成される。
+/// 描画コマンド。ベクターパスと、埋め込みラスター画像（PDF の図など）。
 pub enum DrawCommand {
     Path(PathData),
+    Image(ImageData),
+}
+
+/// 埋め込みラスター画像1枚。ページ座標の矩形 `rect` に RGBA8 画素を貼り付ける。
+/// PDF 内のビットマップ図（pdftocairo が SVG の `<image>` として出力するもの）に対応する。
+pub struct ImageData {
+    /// RGBA8 ストレートアルファ。長さは `px_width * px_height * 4`。
+    pub rgba: Vec<u8>,
+    /// 画素幅。
+    pub px_width: u32,
+    /// 画素高さ。
+    pub px_height: u32,
+    /// ページ座標での配置矩形 [x, y, w, h]（左上原点）。画像はこの矩形へ拡縮して貼られる。
+    pub rect: [f32; 4],
 }
 
 /// パスのセグメント。座標は絶対座標（親の transform 適用済み）。

@@ -2350,6 +2350,7 @@ dependencies = [
  "anyhow",
  "base64",
  "crossterm",
+ "flate2",
  "memmap2",
  "nix 0.29.0",
  "vecview-core",
@@ -2379,6 +2380,7 @@ name = "vecview-svg"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "image",
  "usvg",
  "vecview-core",
 ]

@@ -6,4 +6,5 @@ edition.workspace = true
 [dependencies]
 vecview-core = { path = "../vecview-core" }
 usvg.workspace = true
+image = "0.25"
 anyhow.workspace = true
