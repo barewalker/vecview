@@ -114,7 +114,7 @@ struct Args {
     #[arg(short, long, default_value_t = 100)]
     zoom: u32,
 
-    /// 出力バックエンド強制指定 [kitty|tmux|framebuffer]。
+    /// 出力バックエンド強制指定 [kitty|tmux|sixel|framebuffer]。環境変数 VECVIEW_BACKEND でも可。
     #[arg(short, long)]
     backend: Option<String>,
 
@@ -127,10 +127,15 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     let scale = resolve_scale(args.scale);
+    // 出力バックエンドは CLI 引数 > 環境変数 VECVIEW_BACKEND（未指定なら自動検出）。
+    let backend_choice = args
+        .backend
+        .clone()
+        .or_else(|| std::env::var("VECVIEW_BACKEND").ok());
 
     // 診断モード：VECVIEW_PROBE=1 で端末が報告するサイズを表示して終了する（解像度調査用）。
     if std::env::var_os("VECVIEW_PROBE").is_some() {
-        probe_and_exit(args.backend.as_deref(), scale);
+        probe_and_exit(backend_choice.as_deref(), scale);
     }
 
     if !args.file.exists() {
@@ -166,7 +171,7 @@ fn main() -> Result<()> {
         other => bail!("未対応の拡張子です: .{other}（svg / typ / pdf のみ対応）"),
     };
 
-    let backend = detect_backend(args.backend.as_deref());
+    let backend = detect_backend(backend_choice.as_deref());
     // GPU レンダラーは SVG/Typst のベクター描画にのみ使う。PDF は pdfium が描画するので初期化しない。
     let renderer = if matches!(source, Source::Pdf { .. }) {
         None
