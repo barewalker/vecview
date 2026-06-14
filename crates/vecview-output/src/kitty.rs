@@ -163,6 +163,15 @@ impl OutputBackend for KittyBackend {
         Ok(())
     }
 
+    fn clear(&self) -> Result<()> {
+        // 画面クリアだけでは Kitty 画像（直接配置）が残るため、先に全画像を削除する。
+        let mut out = std::io::stdout().lock();
+        self.write_apc(&mut out, b"_Ga=d")?;
+        out.write_all(b"\x1b[2J\x1b[H")?;
+        out.flush()?;
+        Ok(())
+    }
+
     fn display(&self, rgba: &[u8], width: u32, height: u32) -> Result<()> {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();

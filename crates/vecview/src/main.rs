@@ -2,8 +2,8 @@
 //!
 //! `vecview <FILE>` で SVG / Typst / PDF をターミナル内にベクター表示する。Typst（`.typ`）は
 //! 内部で `typst watch` を起動して SVG を生成し、その SVG を監視してライブ再描画する。
-//! PDF（`.pdf`）は `pdftocairo` でページごとに SVG へ変換し、元 PDF を監視して保存のたびに
-//! 再変換する。いずれもブラウザ不要・ターミナル内完結のベクタープレビューを実現する。
+//! PDF（`.pdf`）は `pdfium` で表示解像度に直接ラスタライズし、元 PDF を監視して保存のたびに
+//! 開き直す。いずれもブラウザ不要・ターミナル内完結のプレビューを実現する。
 //!
 //! 端末（TTY）で起動するとインタラクティブモードになり、キーでズーム・ページ送り・終了できる。
 
@@ -32,38 +32,33 @@ enum Msg {
     Key(KeyEvent),
 }
 
-/// 表示ソース。ページごとに 1 つの SVG を持つ。
+/// 表示ソース。SVG/Typst はページ SVG ファイル、PDF は pdfium で直接描画する。
 #[derive(Clone)]
 enum Source {
     /// 単一 SVG ファイル。
     Svg(PathBuf),
     /// Typst（`typst watch` が `vecview-<stem>-<p>.svg` をページごとに出力）。
     Typst { dir: PathBuf, stem: String },
-    /// PDF（`pdftocairo` が `vecview-<stem>-<p>.svg` をページごとに生成。元 PDF を監視し
-    /// 保存のたび全ページ再変換する）。
-    Pdf {
-        pdf: PathBuf,
-        dir: PathBuf,
-        stem: String,
-    },
+    /// PDF（pdfium で直接ラスタライズ。ファイルは持たず、ドキュメントは main 側で保持）。
+    /// 元 PDF を監視し、保存のたび開き直す。
+    Pdf { pdf: PathBuf },
 }
 
 impl Source {
-    /// ページ `idx`（0始まり）の SVG パス。
+    /// ページ `idx`（0始まり）の SVG パス（SVG/Typst のみ。PDF はファイルベースでないため未使用）。
     fn page_path(&self, idx: usize) -> PathBuf {
         match self {
             Source::Svg(p) => p.clone(),
-            Source::Typst { dir, stem } | Source::Pdf { dir, stem, .. } => {
-                dir.join(format!("vecview-{stem}-{}.svg", idx + 1))
-            }
+            Source::Typst { dir, stem } => dir.join(format!("vecview-{stem}-{}.svg", idx + 1)),
+            Source::Pdf { pdf } => pdf.clone(),
         }
     }
 
-    /// 現在存在するページ数（Typst/PDF は連番ファイルを数える）。最低 1。
+    /// SVG=1、Typst=連番ファイル数。PDF は pdfium のページ数を使うため [`current_page_count`] 側で扱う。
     fn page_count(&self) -> usize {
         match self {
-            Source::Svg(_) => 1,
-            Source::Typst { dir, stem } | Source::Pdf { dir, stem, .. } => {
+            Source::Svg(_) | Source::Pdf { .. } => 1,
+            Source::Typst { dir, stem } => {
                 let mut n = 0;
                 while dir.join(format!("vecview-{stem}-{}.svg", n + 1)).exists() {
                     n += 1;
@@ -78,7 +73,7 @@ impl Source {
         let base = match self {
             Source::Svg(p) => p.parent().map(Path::to_path_buf),
             Source::Typst { dir, .. } => Some(dir.clone()),
-            Source::Pdf { pdf, .. } => pdf.parent().map(Path::to_path_buf),
+            Source::Pdf { pdf } => pdf.parent().map(Path::to_path_buf),
         };
         base.filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| PathBuf::from("."))
@@ -88,7 +83,7 @@ impl Source {
     fn owns(&self, path: &Path) -> bool {
         match self {
             Source::Svg(p) => path == p,
-            Source::Pdf { pdf, .. } => path == pdf,
+            Source::Pdf { pdf } => path == pdf,
             Source::Typst { dir, stem } => {
                 path.parent() == Some(dir.as_path())
                     && path
@@ -99,13 +94,13 @@ impl Source {
             }
         }
     }
+}
 
-    /// 監視対象が変化したときの再生成。PDF は元ファイルを全ページ再変換する。
-    fn reconvert(&self) -> Result<()> {
-        if let Source::Pdf { pdf, dir, stem } = self {
-            vecview_pdf::convert_to_svgs(pdf, dir, stem)?;
-        }
-        Ok(())
+/// 現在のページ数。PDF は開いている pdfium ドキュメントの値、SVG/Typst は [`Source::page_count`]。
+fn current_page_count(source: &Source, pdf: Option<&vecview_pdf::Pdf>) -> usize {
+    match source {
+        Source::Pdf { .. } => pdf.map(|p| p.page_count()).unwrap_or(1),
+        other => other.page_count(),
     }
 }
 
@@ -149,6 +144,10 @@ fn main() -> Result<()> {
         .unwrap_or("")
         .to_ascii_lowercase();
 
+    // PDF は pdfium で直接描画する（pdftocairo→SVG→usvg 経路はネスト <use> の transform
+    // 二重適用バグで図がずれるため）。開いたドキュメントはここで保持する。
+    let mut pdf_doc: Option<vecview_pdf::Pdf> = None;
+
     // Typst は typst watch を起動して SVG を生成。SVG はそのまま監視。
     let (source, mut child) = match ext.as_str() {
         "typ" => {
@@ -159,33 +158,33 @@ fn main() -> Result<()> {
             let canonical = std::fs::canonicalize(&args.file).unwrap_or_else(|_| args.file.clone());
             (Source::Svg(canonical), None)
         }
-        // PDF は起動時に全ページを SVG 化（typst のような常駐ウォッチャは不要。元 PDF の
-        // 変更は下のファイル監視で検知して再変換する）。
         "pdf" => {
             let canonical = std::fs::canonicalize(&args.file).unwrap_or_else(|_| args.file.clone());
-            let stem = canonical
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("vecview")
-                .to_string();
-            let dir = std::env::temp_dir();
-            vecview_pdf::convert_to_svgs(&canonical, &dir, &stem).context("PDF の変換")?;
-            (Source::Pdf { pdf: canonical, dir, stem }, None)
+            pdf_doc = Some(vecview_pdf::Pdf::open(&canonical).context("PDF を開けません")?);
+            (Source::Pdf { pdf: canonical }, None)
         }
         other => bail!("未対応の拡張子です: .{other}（svg / typ / pdf のみ対応）"),
     };
 
     let backend = detect_backend(args.backend.as_deref());
-    let renderer = Renderer::new().context("レンダラー初期化")?;
+    // GPU レンダラーは SVG/Typst のベクター描画にのみ使う。PDF は pdfium が描画するので初期化しない。
+    let renderer = if matches!(source, Source::Pdf { .. }) {
+        None
+    } else {
+        Some(Renderer::new().context("レンダラー初期化")?)
+    };
     eprintln!(
-        "vecview: backend={} | GPU={} | {}",
+        "vecview: backend={} | {} | {}",
         backend.name(),
-        renderer.adapter_info,
+        renderer
+            .as_ref()
+            .map(|r| format!("GPU={}", r.adapter_info))
+            .unwrap_or_else(|| "engine=pdfium".to_string()),
         source.watch_dir().display()
     );
     eprintln!(
         "操作: +/- ズーム  0 リセット  w 左右フィット  v 上下フィット  \
-         n/Space/PgDn 次頁  p/PgUp 前頁  hjkl/矢印 パン  q 終了"
+         n/Space/PgDn 次頁  p/PgUp 前頁  hjkl/矢印 パン  ? ヘルプ  q 終了"
     );
 
     // ファイル監視（親ディレクトリを NonRecursive で監視し atomic rename を取りこぼさない）。
@@ -244,13 +243,21 @@ fn main() -> Result<()> {
         last_vh: 0.0,
         scale,
         pending_fit: None,
+        help: false,
     };
     // 最後に描画した (ページ, mtime)。描画のたびに SVG を読むと atime が変わり notify が
     // 再発火する（自己トリガー）ため、同一ページで mtime 不変なら描画しない。
     let mut last_render: Option<(usize, SystemTime)> = None;
 
     // 初回描画（.typ は生成待ちのため存在しないことがある）。
-    render_current(&source, &mut state, &renderer, backend.as_ref(), &mut last_render);
+    render_current(
+        &source,
+        pdf_doc.as_ref(),
+        &mut state,
+        renderer.as_ref(),
+        backend.as_ref(),
+        &mut last_render,
+    );
 
     while let Ok(first) = rx.recv() {
         // バーストをまとめて取り出す。連続する Reload は1回の描画に集約し、Quit/キーが
@@ -262,8 +269,10 @@ fn main() -> Result<()> {
 
         let mut quit = false;
         let mut reload = false;
-        let mut dirty = false; // キー操作などで再描画が必要。
+        let mut dirty = false; // キー操作などで通常表示の再描画が必要。
+        let mut help_changed = false; // ヘルプの表示/非表示が切り替わった。
 
+        let pages = current_page_count(&source, pdf_doc.as_ref());
         for m in msgs {
             match m {
                 Msg::Quit => {
@@ -279,8 +288,17 @@ fn main() -> Result<()> {
                             quit = true;
                             break;
                         }
+                        Some(Action::ToggleHelp) => {
+                            state.help = !state.help;
+                            help_changed = true;
+                        }
+                        // ヘルプ表示中はどのキーでも閉じる（その操作は消費する）。
+                        _ if state.help => {
+                            state.help = false;
+                            help_changed = true;
+                        }
                         Some(action) => {
-                            apply_action(action, &source, &mut state);
+                            apply_action(action, pages, &mut state);
                             dirty = true;
                         }
                         None => {}
@@ -296,20 +314,21 @@ fn main() -> Result<()> {
         }
 
         if reload {
-            if matches!(source, Source::Pdf { .. }) {
-                // PDF は元ファイルが変わったので全ページを再変換する（監視対象＝元 PDF、
-                // 描画対象＝temp の SVG なので自己トリガーは起きない）。
-                match source.reconvert() {
-                    Ok(()) => {
-                        let pc = source.page_count();
+            if let Source::Pdf { pdf } = &source {
+                // 元 PDF が変わったので開き直す（監視対象＝元 PDF、描画は pdfium がメモリ上の
+                // ドキュメントから行うので自己トリガーは起きない）。
+                match vecview_pdf::Pdf::open(pdf) {
+                    Ok(doc) => {
+                        let pc = doc.page_count();
+                        pdf_doc = Some(doc);
                         if state.page >= pc {
                             state.page = pc - 1;
                             state.center = None;
                         }
                         dirty = true;
                     }
-                    // 書き込み途中の PDF を読むと一時的に失敗する。次の Reload で取り直す。
-                    Err(e) => eprintln!("vecview: PDF 再変換エラー: {e:#}"),
+                    // 書き込み途中の PDF を開くと一時的に失敗する。次の Reload で取り直す。
+                    Err(e) => eprintln!("vecview: PDF 再オープンエラー: {e:#}"),
                 }
             } else {
                 // SVG/Typst は描画が atime を変えて notify が再発火する（自己トリガー）。
@@ -325,8 +344,21 @@ fn main() -> Result<()> {
             }
         }
 
-        if dirty {
-            render_current(&source, &mut state, &renderer, backend.as_ref(), &mut last_render);
+        // 描画判定。ヘルプ表示中は通常描画を抑止し（Reload が来ても画像で上書きしない＝点滅
+        // 防止。再オープン自体は実行済みなので閉じれば最新が出る）、切り替わった時だけ描き直す。
+        if state.help {
+            if help_changed {
+                draw_help(backend.as_ref());
+            }
+        } else if dirty || help_changed {
+            render_current(
+                &source,
+                pdf_doc.as_ref(),
+                &mut state,
+                renderer.as_ref(),
+                backend.as_ref(),
+                &mut last_render,
+            );
         }
     }
 
@@ -355,6 +387,8 @@ struct ViewState {
     scale: u32,
     /// 次回描画時に本文境界へフィットさせる要求（描画時に本文 bbox を見て zoom/center へ反映）。
     pending_fit: Option<Fit>,
+    /// ヘルプ（ショートカット一覧）を表示中か。
+    help: bool,
 }
 
 /// 本文（ink）境界へのフィット方向。
@@ -378,6 +412,8 @@ enum Action {
     PrevPage,
     /// 本文境界へフィット（左右/上下）。
     FitContent(Fit),
+    /// ショートカット一覧の表示/非表示を切り替える。
+    ToggleHelp,
 }
 
 /// ズーム倍率（%）。最小はフィット(100)、最大は16倍。
@@ -393,6 +429,7 @@ fn key_action(k: &KeyEvent) -> Option<Action> {
         KeyCode::Char('+') | KeyCode::Char('=') => Some(Action::ZoomIn),
         KeyCode::Char('-') | KeyCode::Char('_') => Some(Action::ZoomOut),
         KeyCode::Char('0') => Some(Action::ZoomReset),
+        KeyCode::Char('?') => Some(Action::ToggleHelp),
         // 本文フィット。w=左右いっぱい、v=上下いっぱい。
         KeyCode::Char('w') => Some(Action::FitContent(Fit::Width)),
         KeyCode::Char('v') => Some(Action::FitContent(Fit::Height)),
@@ -408,7 +445,7 @@ fn key_action(k: &KeyEvent) -> Option<Action> {
     }
 }
 
-fn apply_action(action: Action, source: &Source, state: &mut ViewState) {
+fn apply_action(action: Action, pages: usize, state: &mut ViewState) {
     match action {
         Action::Quit => {}
         // 乗算式（約1.5倍ずつ）。フィット(100%)が最小、それ以下は白地が広がるだけなので不可。
@@ -426,7 +463,7 @@ fn apply_action(action: Action, source: &Source, state: &mut ViewState) {
             }
         }
         Action::NextPage => {
-            if state.page + 1 < source.page_count() {
+            if state.page + 1 < pages {
                 state.page += 1;
                 state.center = None;
             }
@@ -437,30 +474,103 @@ fn apply_action(action: Action, source: &Source, state: &mut ViewState) {
                 state.center = None;
             }
         }
-        // 本文 bbox は描画時にしか分からない（ページの SVG を読む必要がある）ため、要求だけ
-        // 立てておき、render_and_display で zoom/center に反映する。
+        // 本文 bbox は描画時にしか分からない（ページを読む必要がある）ため、要求だけ立てておき、
+        // 描画時（render_pdf / render_and_display）に zoom/center へ反映する。
         Action::FitContent(fit) => state.pending_fit = Some(fit),
+        // ヘルプはメインループ側で扱う（描画方法が通常表示と異なるため）。
+        Action::ToggleHelp => {}
     }
 }
 
-/// 現在ページを描画して表示する。失敗（ファイル未生成等）時は静かにスキップ。
+/// ショートカット一覧（ヘルプ表示）。英語。
+const HELP_LINES: &[&str] = &[
+    "vecview - keyboard shortcuts",
+    "",
+    "  +/=        zoom in",
+    "  -/_        zoom out",
+    "  0          reset zoom & position",
+    "  w          fit to content width",
+    "  v          fit to content height",
+    "  h j k l    pan (also arrow keys)",
+    "  n / Space  next page (also PageDown)",
+    "  p          previous page (also PageUp/Backspace)",
+    "  ?          toggle this help",
+    "  q / Esc    quit (also Ctrl-C)",
+    "",
+    "  press any key to close",
+];
+
+/// ヘルプ画面を描く。画像を消してテキストを左上に並べる。
+fn draw_help(backend: &dyn OutputBackend) {
+    use std::io::Write;
+    let _ = backend.clear();
+    let mut out = std::io::stdout().lock();
+    for (i, line) in HELP_LINES.iter().enumerate() {
+        // 行頭（ペイン相対）へ移動して出力。raw mode のため明示的に桁も指定する。
+        let _ = write!(out, "\x1b[{};3H{line}", i + 2);
+    }
+    let _ = out.flush();
+}
+
+/// 現在ページを描画して表示する。PDF は pdfium、SVG/Typst は GPU レンダラー。
+/// 失敗（ファイル未生成等）時は静かにスキップ。
 fn render_current(
     source: &Source,
+    pdf: Option<&vecview_pdf::Pdf>,
     state: &mut ViewState,
-    renderer: &Renderer,
+    renderer: Option<&Renderer>,
     backend: &dyn OutputBackend,
     last_render: &mut Option<(usize, SystemTime)>,
 ) {
-    let path = source.page_path(state.page);
-    if !path.exists() {
-        return;
-    }
-    match render_and_display(&path, renderer, backend, state) {
-        Ok(()) => {
-            *last_render = mtime_of(&path).map(|m| (state.page, m));
+    match source {
+        Source::Pdf { .. } => {
+            let Some(doc) = pdf else { return };
+            if let Err(e) = render_pdf(doc, backend, state) {
+                eprintln!("vecview: 描画エラー: {e:#}");
+            }
         }
-        Err(e) => eprintln!("vecview: 描画エラー: {e:#}"),
+        _ => {
+            let path = source.page_path(state.page);
+            if !path.exists() {
+                return;
+            }
+            let Some(renderer) = renderer else { return };
+            match render_and_display(&path, renderer, backend, state) {
+                Ok(()) => *last_render = mtime_of(&path).map(|m| (state.page, m)),
+                Err(e) => eprintln!("vecview: 描画エラー: {e:#}"),
+            }
+        }
     }
+}
+
+/// PDF の現在ページを、ズーム/パン状態のビューポートで pdfium にラスタライズさせ表示する。
+fn render_pdf(
+    pdf: &vecview_pdf::Pdf,
+    backend: &dyn OutputBackend,
+    state: &mut ViewState,
+) -> Result<()> {
+    let (pw, ph) = pdf.page_size(state.page)?;
+    let (pw, ph) = (pw.max(1.0), ph.max(1.0));
+
+    // 出力は常にペイン（表示領域）サイズ。ズームはビューポート矩形の大小で表現する。
+    let (out_w, out_h) = available_area(backend.name(), state.scale);
+
+    // 本文フィット要求があれば、本文境界からズーム/中心を算出して通常のビューポート計算へ委譲。
+    if let Some(fit) = state.pending_fit.take() {
+        if let Some(bbox) = pdf.content_bbox(state.page) {
+            apply_fit(fit, bbox, pw, ph, out_w, out_h, state);
+        }
+    }
+
+    let center = state.center.unwrap_or((pw / 2.0, ph / 2.0));
+    let viewport = viewport_for(pw, ph, out_w, out_h, state.zoom, center);
+    state.last_vw = viewport[2];
+    state.last_vh = viewport[3];
+    state.center = Some((viewport[0] + viewport[2] / 2.0, viewport[1] + viewport[3] / 2.0));
+
+    let rgba = pdf.render(state.page, viewport, out_w, out_h)?;
+    backend.display(&rgba, out_w, out_h)?;
+    Ok(())
 }
 
 /// `typst watch <file> <tmp>-{p}.svg` を起動し、(Source, 子プロセス) を返す。
@@ -735,6 +845,7 @@ mod tests {
             last_vh: 0.0,
             scale: 2,
             pending_fit: None,
+            help: false,
         }
     }
 

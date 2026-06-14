@@ -7,4 +7,6 @@ edition.workspace = true
 vecview-core = { path = "../vecview-core" }
 usvg.workspace = true
 image = "0.25"
+regex = "1"
+base64.workspace = true
 anyhow.workspace = true

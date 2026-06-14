@@ -119,4 +119,14 @@ pub trait OutputBackend {
     fn leave(&self) -> Result<()> {
         Ok(())
     }
+
+    /// 画面をテキスト表示用に空にする（描画済み画像の削除＋画面クリア＋カーソル原点）。
+    /// ヘルプ等のテキストオーバーレイを出す前に呼ぶ。デフォルトは端末の画面クリアのみ。
+    fn clear(&self) -> Result<()> {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        out.write_all(b"\x1b[2J\x1b[H")?;
+        out.flush()?;
+        Ok(())
+    }
 }
