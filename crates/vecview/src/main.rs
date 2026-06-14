@@ -182,10 +182,15 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| "engine=pdfium".to_string()),
         source.watch_dir().display()
     );
-    eprintln!(
-        "操作: +/- ズーム  0 リセット  w 左右フィット  v 上下フィット  \
-         n/Space/PgDn 次頁  p/PgUp 前頁  hjkl/矢印 パン  ? ヘルプ  q 終了"
-    );
+    // キーバインドを設定ファイル＋既定値から構築する。
+    let keymap = Keymap::load();
+    let help_key = keymap
+        .help
+        .iter()
+        .find(|(n, _)| *n == "help")
+        .and_then(|(_, k)| k.first().cloned())
+        .unwrap_or_else(|| "?".to_string());
+    eprintln!("操作: {help_key} でヘルプ表示（キーは {} で変更可）", config_path().map(|p| p.display().to_string()).unwrap_or_default());
 
     // ファイル監視（親ディレクトリを NonRecursive で監視し atomic rename を取りこぼさない）。
     // 対象ソースのページファイル以外の変更（temp_dir のノイズ等）は無視する。
@@ -283,7 +288,7 @@ fn main() -> Result<()> {
                     if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                         continue;
                     }
-                    match key_action(&k) {
+                    match keymap.action(&k) {
                         Some(Action::Quit) => {
                             quit = true;
                             break;
@@ -348,7 +353,7 @@ fn main() -> Result<()> {
         // 防止。再オープン自体は実行済みなので閉じれば最新が出る）、切り替わった時だけ描き直す。
         if state.help {
             if help_changed {
-                draw_help(backend.as_ref());
+                draw_help(backend.as_ref(), &keymap);
             }
         } else if dirty || help_changed {
             render_current(
@@ -401,6 +406,7 @@ enum Fit {
 }
 
 /// キー操作。
+#[derive(Clone, Copy)]
 enum Action {
     Quit,
     ZoomIn,
@@ -410,6 +416,8 @@ enum Action {
     Pan(f32, f32),
     NextPage,
     PrevPage,
+    FirstPage,
+    LastPage,
     /// 本文境界へフィット（左右/上下）。
     FitContent(Fit),
     /// ショートカット一覧の表示/非表示を切り替える。
@@ -420,29 +428,145 @@ enum Action {
 const ZOOM_MIN: u32 = 100;
 const ZOOM_MAX: u32 = 1600;
 
-fn key_action(k: &KeyEvent) -> Option<Action> {
-    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
-        return Some(Action::Quit);
+/// 設定可能なアクションの一覧: (設定名, アクション, 既定キー)。設定名は config.toml の
+/// `[keys]` のキー、ヘルプ表示順もこの順。既定値:
+/// 拡大時の上下左右移動=矢印、ページ送り/戻り=j/k、先頭/最終ページ=h/l。
+const ACTIONS: &[(&str, Action, &[&str])] = &[
+    ("zoom_in", Action::ZoomIn, &["+", "="]),
+    ("zoom_out", Action::ZoomOut, &["-", "_"]),
+    ("zoom_reset", Action::ZoomReset, &["0"]),
+    ("fit_width", Action::FitContent(Fit::Width), &["w"]),
+    ("fit_height", Action::FitContent(Fit::Height), &["v"]),
+    ("pan_left", Action::Pan(-1.0, 0.0), &["left"]),
+    ("pan_right", Action::Pan(1.0, 0.0), &["right"]),
+    ("pan_up", Action::Pan(0.0, -1.0), &["up"]),
+    ("pan_down", Action::Pan(0.0, 1.0), &["down"]),
+    ("next_page", Action::NextPage, &["j", "space", "pagedown"]),
+    ("prev_page", Action::PrevPage, &["k", "pageup", "backspace"]),
+    ("first_page", Action::FirstPage, &["h"]),
+    ("last_page", Action::LastPage, &["l"]),
+    ("help", Action::ToggleHelp, &["?"]),
+    ("quit", Action::Quit, &["q", "esc", "ctrl+c"]),
+];
+
+/// キー（コード＋Ctrl 有無）→アクションの対応表と、ヘルプ表示用の有効バインドを保持する。
+struct Keymap {
+    lookup: std::collections::HashMap<(KeyCode, bool), Action>,
+    /// (設定名, 実際のキー文字列) を ACTIONS 順に。ヘルプ表示・設定リファレンス用。
+    help: Vec<(&'static str, Vec<String>)>,
+}
+
+impl Keymap {
+    /// 既定値＋設定ファイルの上書きからキーマップを構築する。
+    fn load() -> Self {
+        Self::build(&read_key_overrides())
     }
-    match k.code {
-        KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
-        KeyCode::Char('+') | KeyCode::Char('=') => Some(Action::ZoomIn),
-        KeyCode::Char('-') | KeyCode::Char('_') => Some(Action::ZoomOut),
-        KeyCode::Char('0') => Some(Action::ZoomReset),
-        KeyCode::Char('?') => Some(Action::ToggleHelp),
-        // 本文フィット。w=左右いっぱい、v=上下いっぱい。
-        KeyCode::Char('w') => Some(Action::FitContent(Fit::Width)),
-        KeyCode::Char('v') => Some(Action::FitContent(Fit::Height)),
-        // パン（vim hjkl ＋ 矢印）。
-        KeyCode::Char('h') | KeyCode::Left => Some(Action::Pan(-1.0, 0.0)),
-        KeyCode::Char('l') | KeyCode::Right => Some(Action::Pan(1.0, 0.0)),
-        KeyCode::Char('k') | KeyCode::Up => Some(Action::Pan(0.0, -1.0)),
-        KeyCode::Char('j') | KeyCode::Down => Some(Action::Pan(0.0, 1.0)),
-        // ページ送り。
-        KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::PageDown => Some(Action::NextPage),
-        KeyCode::Char('p') | KeyCode::Backspace | KeyCode::PageUp => Some(Action::PrevPage),
-        _ => None,
+
+    /// 既定値に `overrides`（設定名→キー文字列）を被せてキーマップを構築する。
+    fn build(overrides: &std::collections::HashMap<String, Vec<String>>) -> Self {
+        let mut lookup = std::collections::HashMap::new();
+        let mut help = Vec::new();
+        for (name, action, defaults) in ACTIONS {
+            let keys: Vec<String> = match overrides.get(*name) {
+                Some(v) => v.clone(),
+                None => defaults.iter().map(|s| s.to_string()).collect(),
+            };
+            for spec in &keys {
+                match parse_key(spec) {
+                    Some(key) => {
+                        lookup.insert(key, *action);
+                    }
+                    None => eprintln!("vecview: 不明なキー指定 {spec:?}（{name}）"),
+                }
+            }
+            help.push((*name, keys));
+        }
+        Keymap { lookup, help }
     }
+
+    /// キーイベントに対応するアクションを返す。
+    fn action(&self, k: &KeyEvent) -> Option<Action> {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        self.lookup.get(&(k.code, ctrl)).copied()
+    }
+}
+
+/// 設定ファイル `[keys]` から「設定名→キー文字列の並び」を読む。存在/解析失敗時は空（既定のみ）。
+fn read_key_overrides() -> std::collections::HashMap<String, Vec<String>> {
+    let mut out = std::collections::HashMap::new();
+    let Some(path) = config_path() else {
+        return out;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return out;
+    };
+    let table = match text.parse::<toml::Table>() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("vecview: 設定ファイル解析エラー ({}): {e}", path.display());
+            return out;
+        }
+    };
+    let Some(keys) = table.get("keys").and_then(|v| v.as_table()) else {
+        return out;
+    };
+    for (action, val) in keys {
+        let list: Vec<String> = match val {
+            toml::Value::String(s) => vec![s.clone()],
+            toml::Value::Array(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+            _ => continue,
+        };
+        out.insert(action.clone(), list);
+    }
+    out
+}
+
+/// 設定ファイルのパス。優先順位: 環境変数 VECVIEW_CONFIG > $XDG_CONFIG_HOME/vecview/config.toml
+/// > ~/.config/vecview/config.toml。
+fn config_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("VECVIEW_CONFIG") {
+        return Some(PathBuf::from(p));
+    }
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("vecview").join("config.toml"))
+}
+
+/// キー指定文字列を (KeyCode, Ctrl有無) に解析する。例: "q", "+", "left", "space", "ctrl+c"。
+/// 名前付きキーは大小無視、1文字キーは記号・大小をそのまま使う。
+fn parse_key(spec: &str) -> Option<(KeyCode, bool)> {
+    let spec = spec.trim();
+    let (ctrl, rest) = match spec.strip_prefix("ctrl+").or_else(|| spec.strip_prefix("Ctrl+")) {
+        Some(r) => (true, r),
+        None => (false, spec),
+    };
+    let code = match rest.to_ascii_lowercase().as_str() {
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "space" => KeyCode::Char(' '),
+        "tab" => KeyCode::Tab,
+        "enter" | "return" => KeyCode::Enter,
+        "esc" | "escape" => KeyCode::Esc,
+        "backspace" => KeyCode::Backspace,
+        "delete" | "del" => KeyCode::Delete,
+        "pageup" | "pgup" => KeyCode::PageUp,
+        "pagedown" | "pgdn" => KeyCode::PageDown,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        _ => {
+            // 1文字キー（記号・英数字）。元の大小・記号をそのまま使う。
+            let mut chars = rest.chars();
+            let c = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            KeyCode::Char(c)
+        }
+    };
+    Some((code, ctrl))
 }
 
 fn apply_action(action: Action, pages: usize, state: &mut ViewState) {
@@ -474,6 +598,19 @@ fn apply_action(action: Action, pages: usize, state: &mut ViewState) {
                 state.center = None;
             }
         }
+        Action::FirstPage => {
+            if state.page != 0 {
+                state.page = 0;
+                state.center = None;
+            }
+        }
+        Action::LastPage => {
+            let last = pages.saturating_sub(1);
+            if state.page != last {
+                state.page = last;
+                state.center = None;
+            }
+        }
         // 本文 bbox は描画時にしか分からない（ページを読む必要がある）ため、要求だけ立てておき、
         // 描画時（render_pdf / render_and_display）に zoom/center へ反映する。
         Action::FitContent(fit) => state.pending_fit = Some(fit),
@@ -482,30 +619,32 @@ fn apply_action(action: Action, pages: usize, state: &mut ViewState) {
     }
 }
 
-/// ショートカット一覧（ヘルプ表示）。英語。
-const HELP_LINES: &[&str] = &[
-    "vecview - keyboard shortcuts",
-    "",
-    "  +/=        zoom in",
-    "  -/_        zoom out",
-    "  0          reset zoom & position",
-    "  w          fit to content width",
-    "  v          fit to content height",
-    "  h j k l    pan (also arrow keys)",
-    "  n / Space  next page (also PageDown)",
-    "  p          previous page (also PageUp/Backspace)",
-    "  ?          toggle this help",
-    "  q / Esc    quit (also Ctrl-C)",
-    "",
-    "  press any key to close",
-];
+/// 現在のキーマップからショートカット一覧（ヘルプ表示）を生成する。設定名はそのまま
+/// config.toml の `[keys]` のキーになるので、設定リファレンスも兼ねる。
+fn help_lines(keymap: &Keymap) -> Vec<String> {
+    let mut lines = vec![
+        "vecview - keyboard shortcuts".to_string(),
+        String::new(),
+    ];
+    for (name, keys) in &keymap.help {
+        lines.push(format!("  {name:<12} {}", keys.join(", ")));
+    }
+    lines.push(String::new());
+    let path = config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.config/vecview/config.toml".to_string());
+    lines.push(format!("  config: {path}"));
+    lines.push("    [keys] に  <action> = [\"key\", ...]  で再割り当て可".to_string());
+    lines.push("  press any key to close".to_string());
+    lines
+}
 
 /// ヘルプ画面を描く。画像を消してテキストを左上に並べる。
-fn draw_help(backend: &dyn OutputBackend) {
+fn draw_help(backend: &dyn OutputBackend, keymap: &Keymap) {
     use std::io::Write;
     let _ = backend.clear();
     let mut out = std::io::stdout().lock();
-    for (i, line) in HELP_LINES.iter().enumerate() {
+    for (i, line) in help_lines(keymap).iter().enumerate() {
         // 行頭（ペイン相対）へ移動して出力。raw mode のため明示的に桁も指定する。
         let _ = write!(out, "\x1b[{};3H{line}", i + 2);
     }
@@ -825,8 +964,64 @@ fn clamp_origin(center: f32, v: f32, p: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_fit, content_bbox, resolve_scale, viewport_for, Fit, ViewState};
+    use super::{
+        apply_fit, content_bbox, parse_key, resolve_scale, viewport_for, Action, Fit, Keymap,
+        ViewState,
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::collections::HashMap;
     use vecview_core::{DrawCommand, Page, PathData, PathSegment};
+
+    fn key(code: KeyCode, ctrl: bool) -> KeyEvent {
+        let m = if ctrl {
+            KeyModifiers::CONTROL
+        } else {
+            KeyModifiers::NONE
+        };
+        KeyEvent::new(code, m)
+    }
+
+    #[test]
+    fn parse_key_forms() {
+        assert_eq!(parse_key("q"), Some((KeyCode::Char('q'), false)));
+        assert_eq!(parse_key("+"), Some((KeyCode::Char('+'), false)));
+        assert_eq!(parse_key("?"), Some((KeyCode::Char('?'), false)));
+        assert_eq!(parse_key("ctrl+c"), Some((KeyCode::Char('c'), true)));
+        assert_eq!(parse_key("left"), Some((KeyCode::Left, false)));
+        assert_eq!(parse_key("space"), Some((KeyCode::Char(' '), false)));
+        assert_eq!(parse_key("PageDown"), Some((KeyCode::PageDown, false)));
+        assert_eq!(parse_key("esc"), Some((KeyCode::Esc, false)));
+        assert_eq!(parse_key("foo"), None); // 複数文字の未知名は不可。
+    }
+
+    #[test]
+    fn default_bindings_match_request() {
+        // 既定: 矢印=パン、j/k=ページ送り/戻り、h/l=先頭/最終ページ。
+        let km = Keymap::build(&HashMap::new());
+        assert!(matches!(km.action(&key(KeyCode::Up, false)), Some(Action::Pan(0.0, -1.0))));
+        assert!(matches!(km.action(&key(KeyCode::Down, false)), Some(Action::Pan(0.0, 1.0))));
+        assert!(matches!(km.action(&key(KeyCode::Left, false)), Some(Action::Pan(-1.0, 0.0))));
+        assert!(matches!(km.action(&key(KeyCode::Right, false)), Some(Action::Pan(1.0, 0.0))));
+        assert!(matches!(km.action(&key(KeyCode::Char('j'), false)), Some(Action::NextPage)));
+        assert!(matches!(km.action(&key(KeyCode::Char('k'), false)), Some(Action::PrevPage)));
+        assert!(matches!(km.action(&key(KeyCode::Char('h'), false)), Some(Action::FirstPage)));
+        assert!(matches!(km.action(&key(KeyCode::Char('l'), false)), Some(Action::LastPage)));
+        assert!(matches!(km.action(&key(KeyCode::Char('c'), true)), Some(Action::Quit)));
+        // 旧パン hjkl は既定では割り当てなし（h/l は別アクション、j/k はページ）。
+        assert!(matches!(km.action(&key(KeyCode::Char('j'), false)), Some(Action::NextPage)));
+    }
+
+    #[test]
+    fn override_replaces_action_keys() {
+        // next_page を space のみへ。j は未割り当てになる。
+        let mut ov = HashMap::new();
+        ov.insert("next_page".to_string(), vec!["space".to_string()]);
+        let km = Keymap::build(&ov);
+        assert!(matches!(km.action(&key(KeyCode::Char(' '), false)), Some(Action::NextPage)));
+        assert!(km.action(&key(KeyCode::Char('j'), false)).is_none());
+        // 上書きしていない prev_page は既定の k のまま。
+        assert!(matches!(km.action(&key(KeyCode::Char('k'), false)), Some(Action::PrevPage)));
+    }
 
     fn path(segments: Vec<PathSegment>) -> DrawCommand {
         DrawCommand::Path(PathData {
