@@ -66,6 +66,14 @@ pub fn is_available() -> bool {
     pdfium().is_ok()
 }
 
+/// テキスト層の1文字。ページ座標（左上原点・Y下向き, pt）の矩形 `rect`=[x, y, w, h] と
+/// その文字 `ch` を持つ。`page_text` が読み順（pdfium の文字インデックス順）で返す。
+#[derive(Clone, Debug)]
+pub struct Glyph {
+    pub ch: char,
+    pub rect: [f32; 4],
+}
+
 /// 開いた PDF。ページのラスタライズと本文境界の取得を提供する。
 pub struct Pdf {
     doc: PdfDocument<'static>,
@@ -143,6 +151,34 @@ impl Pdf {
         }
         // 左上原点へ変換（y_top = ph - top）。
         Some([left, ph - top, w, h])
+    }
+
+    /// ページ `index` のテキスト層を読み順で返す。各文字はページ座標（左上原点・Y下向き, pt）の
+    /// 矩形を持つ。pdfium の `loose_bounds`（グリフ全体を含む緩い矩形）を `ph - top` で左上原点へ
+    /// 変換する。グリフ矩形が取れない文字（制御文字等）はスキップする。Typst のテキスト選択では、
+    /// 表示用 SVG と pt 寸法が一致する併用 PDF をこの API で読む。
+    pub fn page_text(&self, index: usize) -> Result<Vec<Glyph>> {
+        let page = self.page(index)?;
+        let ph = page.height().value;
+        let text = page
+            .text()
+            .map_err(|e| anyhow!("テキスト取得失敗: {e}"))?;
+        let chars = text.chars();
+        let mut out = Vec::with_capacity(chars.len());
+        for c in chars.iter() {
+            let Some(ch) = c.unicode_char() else { continue };
+            // 改行・タブ等は矩形を持たず連結時に効くので、矩形ゼロで保持する。
+            let rect = match c.loose_bounds() {
+                Ok(b) => {
+                    let (left, right) = (b.left().value, b.right().value);
+                    let (top, bottom) = (b.top().value, b.bottom().value); // PDF は top > bottom。
+                    [left, ph - top, (right - left).max(0.0), (top - bottom).max(0.0)]
+                }
+                Err(_) => [0.0, 0.0, 0.0, 0.0],
+            };
+            out.push(Glyph { ch, rect });
+        }
+        Ok(out)
     }
 
     fn page(&self, index: usize) -> Result<PdfPage<'_>> {

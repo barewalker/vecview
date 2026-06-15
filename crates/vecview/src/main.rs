@@ -14,7 +14,10 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use notify_debouncer_full::notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use vecview_core::{Document, DrawCommand, OutputBackend, Page, PathSegment};
@@ -30,6 +33,8 @@ enum Msg {
     Quit,
     /// キー入力。
     Key(KeyEvent),
+    /// マウス入力（テキスト選択用）。
+    Mouse(MouseEvent),
 }
 
 /// 表示ソース。SVG/Typst はページ SVG ファイル、PDF は pdfium で直接描画する。
@@ -228,11 +233,18 @@ fn main() -> Result<()> {
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
     if interactive {
         crossterm::terminal::enable_raw_mode().ok();
+        // テキスト選択のためマウスレポートを有効化する（終了時に無効化）。
+        crossterm::execute!(std::io::stdout(), EnableMouseCapture).ok();
         let key_tx = tx.clone();
         std::thread::spawn(move || loop {
             match crossterm::event::read() {
                 Ok(Event::Key(k)) => {
                     if key_tx.send(Msg::Key(k)).is_err() {
+                        break;
+                    }
+                }
+                Ok(Event::Mouse(m)) => {
+                    if key_tx.send(Msg::Mouse(m)).is_err() {
                         break;
                     }
                 }
@@ -254,6 +266,9 @@ fn main() -> Result<()> {
         scale,
         pending_fit: None,
         help: false,
+        copy: None,
+        last_viewport: None,
+        status: None,
     };
     // 最後に描画した (ページ, mtime)。描画のたびに SVG を読むと atime が変わり notify が
     // 再発火する（自己トリガー）ため、同一ページで mtime 不変なら描画しない。
@@ -293,6 +308,25 @@ fn main() -> Result<()> {
                     if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                         continue;
                     }
+                    // copy mode 中はキーをそちらで消費する（通常ナビと衝突させない）。
+                    if let Some(mut cm) = state.copy.take() {
+                        match handle_copy_key(&k, &mut cm) {
+                            CopyOutcome::Yank => {
+                                let text = cm.selected_text();
+                                let n = text.chars().count();
+                                copy_to_clipboard(&text);
+                                state.status = Some(format!("copied {n} chars"));
+                                dirty = true; // cm は戻さない＝抜ける。
+                            }
+                            CopyOutcome::Exit => dirty = true,
+                            CopyOutcome::Redraw => {
+                                state.copy = Some(cm);
+                                dirty = true;
+                            }
+                            CopyOutcome::Ignore => state.copy = Some(cm),
+                        }
+                        continue;
+                    }
                     match keymap.action(&k) {
                         Some(Action::Quit) => {
                             quit = true;
@@ -307,11 +341,75 @@ fn main() -> Result<()> {
                             state.help = false;
                             help_changed = true;
                         }
+                        Some(Action::EnterCopyMode) => {
+                            match build_text_layer(&source, &args.file, pdf_doc.as_ref(), state.page)
+                            {
+                                Ok(glyphs) => match CopyMode::new(glyphs) {
+                                    Some(cm) => state.copy = Some(cm),
+                                    None => {
+                                        state.status =
+                                            Some("no selectable text on this page".to_string())
+                                    }
+                                },
+                                Err(e) => state.status = Some(format!("text layer error: {e:#}")),
+                            }
+                            dirty = true;
+                        }
                         Some(action) => {
                             apply_action(action, pages, &mut state);
                             dirty = true;
                         }
                         None => {}
+                    }
+                }
+                Msg::Mouse(m) => {
+                    match m.kind {
+                        // 押下: copy mode でなければテキスト層を作って入り、最寄り文字にアンカー。
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if state.copy.is_none() {
+                                if let Ok(glyphs) = build_text_layer(
+                                    &source,
+                                    &args.file,
+                                    pdf_doc.as_ref(),
+                                    state.page,
+                                ) {
+                                    state.copy = CopyMode::new(glyphs);
+                                }
+                            }
+                            if let Some(idx) = mouse_to_glyph(&state, m.column, m.row) {
+                                if let Some(cm) = state.copy.as_mut() {
+                                    cm.cursor = idx;
+                                    cm.anchor = Some(idx);
+                                    dirty = true;
+                                }
+                            }
+                        }
+                        // ドラッグ: キャレットを伸ばす（アンカーは保持）。
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            if let Some(idx) = mouse_to_glyph(&state, m.column, m.row) {
+                                if let Some(cm) = state.copy.as_mut() {
+                                    cm.cursor = idx;
+                                    dirty = true;
+                                }
+                            }
+                        }
+                        // 離す: 実際にドラッグした（範囲がある）ならコピーして抜ける。
+                        // 単クリックはキャレットを置くだけで継続（その後キーボードで選択可）。
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            if let Some(cm) = state.copy.take() {
+                                let drag = matches!(cm.anchor, Some(a) if a != cm.cursor);
+                                if drag {
+                                    let text = cm.selected_text();
+                                    let n = text.chars().count();
+                                    copy_to_clipboard(&text);
+                                    state.status = Some(format!("copied {n} chars"));
+                                } else {
+                                    state.copy = Some(cm);
+                                }
+                                dirty = true;
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Msg::Reload => reload = true,
@@ -352,6 +450,10 @@ fn main() -> Result<()> {
                     dirty = true;
                 }
             }
+            // 再読込で内容が変わったら copy mode のグリフ座標が陳腐化するので抜ける。
+            if dirty {
+                state.copy = None;
+            }
         }
 
         // 描画判定。ヘルプ表示中は通常描画を抑止し（Reload が来ても画像で上書きしない＝点滅
@@ -369,11 +471,14 @@ fn main() -> Result<()> {
                 backend.as_ref(),
                 &mut last_render,
             );
+            // copy mode のステータス/操作ヒントを最下行に出す。
+            draw_overlay_text(backend.as_ref(), &mut state);
         }
     }
 
-    // 後始末：raw mode 解除 + 端末復帰 + typst 子プロセス停止。
+    // 後始末：マウスキャプチャ無効化 + raw mode 解除 + 端末復帰 + typst 子プロセス停止。
     if interactive {
+        crossterm::execute!(std::io::stdout(), DisableMouseCapture).ok();
         crossterm::terminal::disable_raw_mode().ok();
     }
     backend.leave().ok();
@@ -399,6 +504,119 @@ struct ViewState {
     pending_fit: Option<Fit>,
     /// ヘルプ（ショートカット一覧）を表示中か。
     help: bool,
+    /// テキスト選択（copy mode）。None なら通常表示。
+    copy: Option<CopyMode>,
+    /// 直近に描画したページ内ビューポート [x, y, w, h]。マウス座標→ページ座標の逆変換に使う。
+    last_viewport: Option<[f32; 4]>,
+    /// 直近のコピー結果メッセージ（ステータス行に1回だけ出す）。
+    status: Option<String>,
+}
+
+/// テキスト選択（copy mode）の状態。`glyphs` は現ページのテキスト層（読み順）、
+/// `lines` は可視行ごとのグリフ添字（各行は x 昇順）、`line_of` はグリフ→行番号。
+/// `cursor` はキャレット位置（グリフ添字）、`anchor` は選択開始（None なら未選択）。
+struct CopyMode {
+    glyphs: Vec<vecview_pdf::Glyph>,
+    lines: Vec<Vec<usize>>,
+    line_of: Vec<usize>,
+    cursor: usize,
+    anchor: Option<usize>,
+}
+
+impl CopyMode {
+    /// テキスト層からグリフを可視行へグルーピングして copy mode を作る。glyphs が空なら None。
+    /// 制御文字（pdfium が行間に挟む `\r`/`\n` 等。矩形を持たない）は除外し、改行は行ジオメトリから
+    /// 再構成する（[`selected_text`] が行変化に `\n` を挿入）。空白は語間に必要なので残す。
+    fn new(glyphs: Vec<vecview_pdf::Glyph>) -> Option<Self> {
+        let glyphs: Vec<vecview_pdf::Glyph> =
+            glyphs.into_iter().filter(|g| !g.ch.is_control()).collect();
+        if glyphs.is_empty() {
+            return None;
+        }
+        // 読み順のまま、y中心が前行から半文字以上ずれたら改行とみなして行へ束ねる。
+        let mut lines: Vec<Vec<usize>> = Vec::new();
+        let mut line_of = vec![0usize; glyphs.len()];
+        let mut cur_y = f32::NAN;
+        for (i, g) in glyphs.iter().enumerate() {
+            let cy = g.rect[1] + g.rect[3] / 2.0;
+            let h = g.rect[3].max(1.0);
+            let new_line = lines.is_empty() || (cy - cur_y).abs() > h * 0.5;
+            if new_line {
+                lines.push(Vec::new());
+                cur_y = cy;
+            }
+            let li = lines.len() - 1;
+            lines[li].push(i);
+            line_of[i] = li;
+        }
+        Some(Self {
+            glyphs,
+            lines,
+            line_of,
+            cursor: 0,
+            anchor: None,
+        })
+    }
+
+    /// グリフ中心 x。j/k の桁保持に使う。
+    fn center_x(&self, idx: usize) -> f32 {
+        let r = self.glyphs[idx].rect;
+        r[0] + r[2] / 2.0
+    }
+
+    /// 上下の行へ、現在の x になるべく近いグリフへ移動する。
+    fn move_line(&mut self, delta: i32) {
+        let line = self.line_of[self.cursor];
+        let target = line as i32 + delta;
+        if target < 0 || target as usize >= self.lines.len() {
+            return;
+        }
+        let x = self.center_x(self.cursor);
+        let best = self.lines[target as usize]
+            .iter()
+            .copied()
+            .min_by(|&a, &b| {
+                (self.center_x(a) - x)
+                    .abs()
+                    .total_cmp(&(self.center_x(b) - x).abs())
+            });
+        if let Some(b) = best {
+            self.cursor = b;
+        }
+    }
+
+    /// 現在行の先頭/末尾グリフ。
+    fn line_edge(&mut self, end: bool) {
+        let line = &self.lines[self.line_of[self.cursor]];
+        if let Some(&i) = if end { line.last() } else { line.first() } {
+            self.cursor = i;
+        }
+    }
+
+    /// 選択範囲 [start, end]（読み順, 両端含む）。未選択ならキャレット1文字。
+    fn range(&self) -> (usize, usize) {
+        match self.anchor {
+            Some(a) => (a.min(self.cursor), a.max(self.cursor)),
+            None => (self.cursor, self.cursor),
+        }
+    }
+
+    /// 選択テキスト。行が変わる箇所に改行を挿入して連結する。
+    fn selected_text(&self) -> String {
+        let (s, e) = self.range();
+        let mut out = String::new();
+        let mut prev_line: Option<usize> = None;
+        for i in s..=e {
+            if let Some(pl) = prev_line {
+                if self.line_of[i] != pl {
+                    out.push('\n');
+                }
+            }
+            out.push(self.glyphs[i].ch);
+            prev_line = Some(self.line_of[i]);
+        }
+        out
+    }
 }
 
 /// 本文（ink）境界へのフィット方向。
@@ -427,6 +645,8 @@ enum Action {
     FitContent(Fit),
     /// ショートカット一覧の表示/非表示を切り替える。
     ToggleHelp,
+    /// テキスト選択（copy mode）へ入る。
+    EnterCopyMode,
 }
 
 /// ズーム倍率（%）。最小はフィット(100)、最大は16倍。
@@ -450,6 +670,7 @@ const ACTIONS: &[(&str, Action, &[&str])] = &[
     ("prev_page", Action::PrevPage, &["k", "pageup", "backspace"]),
     ("first_page", Action::FirstPage, &["h"]),
     ("last_page", Action::LastPage, &["l"]),
+    ("copy_mode", Action::EnterCopyMode, &["y"]),
     ("help", Action::ToggleHelp, &["?"]),
     ("quit", Action::Quit, &["q", "esc", "ctrl+c"]),
 ];
@@ -619,8 +840,9 @@ fn apply_action(action: Action, pages: usize, state: &mut ViewState) {
         // 本文 bbox は描画時にしか分からない（ページを読む必要がある）ため、要求だけ立てておき、
         // 描画時（render_pdf / render_and_display）に zoom/center へ反映する。
         Action::FitContent(fit) => state.pending_fit = Some(fit),
-        // ヘルプはメインループ側で扱う（描画方法が通常表示と異なるため）。
+        // ヘルプ・copy mode はメインループ側で扱う（描画/入力経路が通常表示と異なるため）。
         Action::ToggleHelp => {}
+        Action::EnterCopyMode => {}
     }
 }
 
@@ -634,6 +856,12 @@ fn help_lines(keymap: &Keymap) -> Vec<String> {
     for (name, keys) in &keymap.help {
         lines.push(format!("  {name:<12} {}", keys.join(", ")));
     }
+    lines.push(String::new());
+    lines.push("  copy mode (text selection):".to_string());
+    lines.push("    hjkl / arrows  move caret    0 / $   line start / end".to_string());
+    lines.push("    g / G          doc start/end space   start/clear selection".to_string());
+    lines.push("    enter or y     copy & exit   esc / q cancel".to_string());
+    lines.push("    mouse drag     select & copy on release".to_string());
     lines.push(String::new());
     let path = config_path()
         .map(|p| p.display().to_string())
@@ -654,6 +882,226 @@ fn draw_help(backend: &dyn OutputBackend, keymap: &Keymap) {
         let _ = write!(out, "\x1b[{};3H{line}", i + 2);
     }
     let _ = out.flush();
+}
+
+/// copy mode のキー1打の結果。
+enum CopyOutcome {
+    /// 再描画する（カーソル/選択が動いた）。
+    Redraw,
+    /// 選択をコピーして copy mode を抜ける。
+    Yank,
+    /// コピーせず copy mode を抜ける。
+    Exit,
+    /// 何もしない（未割り当てキー）。
+    Ignore,
+}
+
+/// copy mode 中のキー処理。移動は vim/tmux 風（hjkl/矢印, 0/$, g/G）、space で選択開始、
+/// enter/y でヤンク、esc/q で取り消し。
+fn handle_copy_key(k: &KeyEvent, cm: &mut CopyMode) -> CopyOutcome {
+    // raw mode では Ctrl-C はキーイベントになる。copy mode に閉じ込めないよう抜ける。
+    if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+        return CopyOutcome::Exit;
+    }
+    let last = cm.glyphs.len() - 1;
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => CopyOutcome::Exit,
+        KeyCode::Enter | KeyCode::Char('y') => CopyOutcome::Yank,
+        // 選択開始/解除のトグル。
+        KeyCode::Char(' ') | KeyCode::Char('v') => {
+            cm.anchor = match cm.anchor {
+                Some(_) => None,
+                None => Some(cm.cursor),
+            };
+            CopyOutcome::Redraw
+        }
+        KeyCode::Char('h') | KeyCode::Left => {
+            cm.cursor = cm.cursor.saturating_sub(1);
+            CopyOutcome::Redraw
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            cm.cursor = (cm.cursor + 1).min(last);
+            CopyOutcome::Redraw
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            cm.move_line(1);
+            CopyOutcome::Redraw
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            cm.move_line(-1);
+            CopyOutcome::Redraw
+        }
+        KeyCode::Char('0') | KeyCode::Home => {
+            cm.line_edge(false);
+            CopyOutcome::Redraw
+        }
+        KeyCode::Char('$') | KeyCode::End => {
+            cm.line_edge(true);
+            CopyOutcome::Redraw
+        }
+        KeyCode::Char('g') => {
+            cm.cursor = 0;
+            CopyOutcome::Redraw
+        }
+        KeyCode::Char('G') => {
+            cm.cursor = last;
+            CopyOutcome::Redraw
+        }
+        _ => CopyOutcome::Ignore,
+    }
+}
+
+/// copy mode 突入時にテキスト層（読み順のグリフ）を作る。PDF は開いているドキュメント、
+/// Typst は表示用 SVG と pt 寸法が一致する PDF を一時生成して読む。単体 SVG はテキスト層なし。
+fn build_text_layer(
+    source: &Source,
+    typ_path: &Path,
+    pdf: Option<&vecview_pdf::Pdf>,
+    page: usize,
+) -> Result<Vec<vecview_pdf::Glyph>> {
+    match source {
+        Source::Pdf { .. } => {
+            let doc = pdf.ok_or_else(|| anyhow!("PDF が開かれていません"))?;
+            doc.page_text(page)
+        }
+        Source::Typst { dir, stem } => {
+            // Typst SVG はグリフをパス化していて文字を持たないため、同じ .typ を PDF にも
+            // コンパイルし、その文字＋座標を使う（pt 寸法は SVG と一致）。
+            let pdf_path = dir.join(format!("vecview-{stem}-text.pdf"));
+            let ok = Command::new("typst")
+                .arg("compile")
+                .arg(typ_path)
+                .arg(&pdf_path)
+                .arg("--format")
+                .arg("pdf")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .context("typst compile（テキスト用 PDF）の起動に失敗")?
+                .success();
+            if !ok {
+                bail!("typst compile（テキスト用 PDF）が失敗しました");
+            }
+            let doc = vecview_pdf::Pdf::open(&pdf_path).context("テキスト用 PDF を開けません")?;
+            doc.page_text(page)
+        }
+        // 単体 SVG（Typst 由来含む）は <text> を持たないことが多く、テキスト層は作れない。
+        Source::Svg(_) => Ok(Vec::new()),
+    }
+}
+
+/// マウスのセル座標 (col,row) を最寄りグリフの添字へ変換する。直近のビューポートと端末セル数から
+/// ページ座標を推定し、中心距離が最小のグリフを返す。
+fn mouse_to_glyph(state: &ViewState, col: u16, row: u16) -> Option<usize> {
+    let cm = state.copy.as_ref()?;
+    let [vx, vy, vw, vh] = state.last_viewport?;
+    let (cols, rows) = crossterm::terminal::size().ok()?;
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    // セル中心の割合 → ページ座標。画像はペイン全体（cols×rows）を覆う前提。
+    let px = vx + (col as f32 + 0.5) / cols as f32 * vw;
+    let py = vy + (row as f32 + 0.5) / rows as f32 * vh;
+    cm.glyphs
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| glyph_dist2(a.rect, px, py).total_cmp(&glyph_dist2(b.rect, px, py)))
+        .map(|(i, _)| i)
+}
+
+/// 点 (px,py) からグリフ矩形中心までの距離の2乗。
+fn glyph_dist2(r: [f32; 4], px: f32, py: f32) -> f32 {
+    let cx = r[0] + r[2] / 2.0;
+    let cy = r[1] + r[3] / 2.0;
+    (cx - px) * (cx - px) + (cy - py) * (cy - py)
+}
+
+/// 選択テキストを OSC 52 でクリップボードへ送る。tmux 内では passthrough でラップする。
+/// X11/Wayland 非依存・SSH 越しでもホスト側クリップボードに入る。
+fn copy_to_clipboard(text: &str) {
+    use base64::Engine;
+    use std::io::Write;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let seq = format!("\x1b]52;c;{b64}\x07");
+    let mut out = std::io::stdout().lock();
+    if std::env::var_os("TMUX").is_some() {
+        // tmux passthrough: 内側の ESC を二重化し \ePtmux;...\e\\ で包む。
+        let inner = seq.replace('\x1b', "\x1b\x1b");
+        let _ = write!(out, "\x1bPtmux;{inner}\x1b\\");
+    } else {
+        let _ = write!(out, "{seq}");
+    }
+    let _ = out.flush();
+}
+
+/// 選択ハイライトとキャレットを RGBA 画像へ直接ブレンドする。ページ座標→出力ピクセルは
+/// viewport の逆変換で求める。
+fn overlay_selection(rgba: &mut [u8], out_w: u32, out_h: u32, viewport: [f32; 4], cm: &CopyMode) {
+    let [vx, vy, vw, vh] = viewport;
+    let sx = out_w as f32 / vw.max(1.0);
+    let sy = out_h as f32 / vh.max(1.0);
+    let selecting = cm.anchor.is_some();
+    let (s, e) = cm.range();
+    if selecting {
+        for i in s..=e {
+            let r = cm.glyphs[i].rect;
+            if r[2] <= 0.0 || r[3] <= 0.0 {
+                continue; // 改行など矩形のない文字。
+            }
+            let x0 = (r[0] - vx) * sx;
+            let y0 = (r[1] - vy) * sy;
+            let x1 = (r[0] + r[2] - vx) * sx;
+            let y1 = (r[1] + r[3] - vy) * sy;
+            blend_rect(rgba, out_w, out_h, [x0, y0, x1, y1], [40, 120, 255], 0.38);
+        }
+    }
+    // キャレット（縦線）。
+    let cr = cm.glyphs[cm.cursor].rect;
+    let cx = (cr[0] - vx) * sx;
+    let cy0 = (cr[1] - vy) * sy;
+    let ch = cr[3].max(8.0) * sy;
+    let cw = (sx * 1.5).max(2.0);
+    blend_rect(rgba, out_w, out_h, [cx, cy0, cx + cw, cy0 + ch], [255, 40, 40], 0.9);
+}
+
+/// 矩形 [x0,y0,x1,y1]（出力ピクセル）に `color` を係数 `a` でアルファブレンドする。
+fn blend_rect(rgba: &mut [u8], w: u32, h: u32, rect: [f32; 4], color: [u8; 3], a: f32) {
+    let [x0, y0, x1, y1] = rect;
+    let xa = x0.min(x1).floor().max(0.0) as u32;
+    let xb = (x0.max(x1).ceil() as i64).clamp(0, w as i64) as u32;
+    let ya = y0.min(y1).floor().max(0.0) as u32;
+    let yb = (y0.max(y1).ceil() as i64).clamp(0, h as i64) as u32;
+    for y in ya..yb {
+        for x in xa..xb {
+            let idx = ((y * w + x) * 4) as usize;
+            if idx + 3 >= rgba.len() {
+                continue;
+            }
+            for c in 0..3 {
+                let bg = rgba[idx + c] as f32;
+                let fg = color[c] as f32;
+                rgba[idx + c] = (bg * (1.0 - a) + fg * a).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
+/// copy mode のステータス（直近のコピー結果）または操作ヒントを最下行に出す。
+fn draw_overlay_text(backend: &dyn OutputBackend, state: &mut ViewState) {
+    use std::io::Write;
+    let _ = backend;
+    let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let mut out = std::io::stdout().lock();
+    if let Some(msg) = state.status.take() {
+        let _ = write!(out, "\x1b[{rows};1H\x1b[2K{msg}");
+        let _ = out.flush();
+    } else if state.copy.is_some() {
+        let _ = write!(
+            out,
+            "\x1b[{rows};1H\x1b[2K-- COPY: hjkl/arrows move, space select, enter yank, esc cancel --"
+        );
+        let _ = out.flush();
+    }
 }
 
 /// 現在ページを描画して表示する。PDF は pdfium、SVG/Typst は GPU レンダラー。
@@ -711,8 +1159,12 @@ fn render_pdf(
     state.last_vw = viewport[2];
     state.last_vh = viewport[3];
     state.center = Some((viewport[0] + viewport[2] / 2.0, viewport[1] + viewport[3] / 2.0));
+    state.last_viewport = Some(viewport);
 
-    let rgba = pdf.render(state.page, viewport, out_w, out_h)?;
+    let mut rgba = pdf.render(state.page, viewport, out_w, out_h)?;
+    if let Some(cm) = &state.copy {
+        overlay_selection(&mut rgba, out_w, out_h, viewport, cm);
+    }
     backend.display(&rgba, out_w, out_h)?;
     Ok(())
 }
@@ -790,8 +1242,12 @@ fn render_and_display(
     state.last_vh = viewport[3];
     // クランプ後のビューポート中心を保存し、以降のパンが端で破綻しないようにする。
     state.center = Some((viewport[0] + viewport[2] / 2.0, viewport[1] + viewport[3] / 2.0));
+    state.last_viewport = Some(viewport);
 
-    let rgba = renderer.render(&page, out_w, out_h, viewport)?;
+    let mut rgba = renderer.render(&page, out_w, out_h, viewport)?;
+    if let Some(cm) = &state.copy {
+        overlay_selection(&mut rgba, out_w, out_h, viewport, cm);
+    }
     backend.display(&rgba, out_w, out_h)?;
     Ok(())
 }
@@ -1046,7 +1502,72 @@ mod tests {
             scale: 2,
             pending_fit: None,
             help: false,
+            copy: None,
+            last_viewport: None,
+            status: None,
         }
+    }
+
+    fn glyph(ch: char, x: f32, y: f32) -> vecview_pdf::Glyph {
+        vecview_pdf::Glyph {
+            ch,
+            rect: [x, y, 8.0, 10.0],
+        }
+    }
+
+    #[test]
+    fn copy_mode_groups_lines_and_drops_control_chars() {
+        // 2行（y=0 と y=20）。間に pdfium 由来の \r\n（矩形ゼロの制御文字）を挟む。
+        let glyphs = vec![
+            glyph('a', 0.0, 0.0),
+            glyph('b', 8.0, 0.0),
+            vecview_pdf::Glyph { ch: '\r', rect: [0.0, 0.0, 0.0, 0.0] },
+            vecview_pdf::Glyph { ch: '\n', rect: [0.0, 0.0, 0.0, 0.0] },
+            glyph('c', 0.0, 20.0),
+            glyph('d', 8.0, 20.0),
+        ];
+        let cm = super::CopyMode::new(glyphs).unwrap();
+        // 制御文字は除外され、可視4文字が2行に分かれる。
+        assert_eq!(cm.glyphs.len(), 4);
+        assert_eq!(cm.lines.len(), 2);
+        assert_eq!(cm.lines[0], vec![0, 1]);
+        assert_eq!(cm.lines[1], vec![2, 3]);
+    }
+
+    #[test]
+    fn copy_mode_selected_text_inserts_newline_on_line_change() {
+        let glyphs = vec![
+            glyph('a', 0.0, 0.0),
+            glyph('b', 8.0, 0.0),
+            glyph('c', 0.0, 20.0),
+        ];
+        let mut cm = super::CopyMode::new(glyphs).unwrap();
+        cm.anchor = Some(0);
+        cm.cursor = 2; // 全選択。
+        assert_eq!(cm.selected_text(), "ab\nc");
+        // 未選択ならキャレット1文字のみ。
+        cm.anchor = None;
+        cm.cursor = 1;
+        assert_eq!(cm.selected_text(), "b");
+    }
+
+    #[test]
+    fn copy_mode_vertical_move_keeps_column() {
+        // 2行、各3文字。上の行で2文字目にいて下へ→下の行の2文字目付近へ。
+        let glyphs = vec![
+            glyph('a', 0.0, 0.0),
+            glyph('b', 8.0, 0.0),
+            glyph('c', 16.0, 0.0),
+            glyph('d', 0.0, 20.0),
+            glyph('e', 8.0, 20.0),
+            glyph('f', 16.0, 20.0),
+        ];
+        let mut cm = super::CopyMode::new(glyphs).unwrap();
+        cm.cursor = 1; // 'b'（x≈8）。
+        cm.move_line(1);
+        assert_eq!(cm.glyphs[cm.cursor].ch, 'e'); // 下行の同桁。
+        cm.move_line(-1);
+        assert_eq!(cm.glyphs[cm.cursor].ch, 'b');
     }
 
     #[test]
