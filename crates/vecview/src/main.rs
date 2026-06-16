@@ -1272,15 +1272,43 @@ fn available_area(backend_name: &str, scale: u32) -> (u32, u32) {
         1
     };
     // 端末のピクセルサイズ（取得できなければセル数から概算、最後は固定値）。
+    // 概算セルサイズは VECVIEW_CELL_PX=幅x高 で上書き可能。SSH+tmux 等ではピクセル寸法が
+    // 伝播せず（width/height=0）、実セルサイズが概算とズレて Sixel が縮小表示されるため、
+    // 環境ごとに 1 度合わせれば以後ペインを正しく埋められる。
+    let (cell_w, cell_h) = fallback_cell_px();
     if let Ok(ws) = crossterm::terminal::window_size() {
         if ws.width > 0 && ws.height > 0 {
             return (ws.width as u32, ws.height as u32);
         }
         if ws.columns > 0 && ws.rows > 0 {
-            return (ws.columns as u32 * 8 * ss, ws.rows as u32 * 16 * ss);
+            // tmux passthrough sixel は画像がペイン下端（=物理画面下端）に達すると画面全体が
+            // スクロールし、隣ペインまで崩れる。最下 1 行ぶん空けて下端に届かないようにする。
+            let rows = if backend_name.contains("passthrough") {
+                (ws.rows as u32).saturating_sub(1).max(1)
+            } else {
+                ws.rows as u32
+            };
+            return (ws.columns as u32 * cell_w * ss, rows * cell_h * ss);
         }
     }
     (1280 * ss, 800 * ss)
+}
+
+/// ピクセル寸法を報告しない端末向けの概算セルサイズ（幅, 高）。既定 8×16。
+/// 環境変数 `VECVIEW_CELL_PX="幅x高"`（例 `10x17`）で上書きできる。各値は 1..=128 にクランプ。
+fn fallback_cell_px() -> (u32, u32) {
+    std::env::var("VECVIEW_CELL_PX")
+        .ok()
+        .and_then(|s| parse_cell_px(&s))
+        .unwrap_or((8, 16))
+}
+
+/// "幅x高"（区切りは `x` または `X`）を (幅, 高) に解析。各値は 1..=128 にクランプ。
+fn parse_cell_px(s: &str) -> Option<(u32, u32)> {
+    let (w, h) = s.trim().split_once(['x', 'X'])?;
+    let w: u32 = w.trim().parse().ok()?;
+    let h: u32 = h.trim().parse().ok()?;
+    Some((w.clamp(1, 128), h.clamp(1, 128)))
 }
 
 /// スーパーサンプリング倍率を決める。優先順位は CLI 引数 > 環境変数 VECVIEW_SCALE > 既定2。
@@ -1377,6 +1405,8 @@ fn probe_and_exit(backend: Option<&str>, scale: u32) -> ! {
         }
         Err(e) => println!("window_size        = エラー: {e}"),
     }
+    let (cw, ch) = fallback_cell_px();
+    println!("fallback cell(px)  = {cw} x {ch}  ← VECVIEW_CELL_PX で上書き可（ピクセル0時に使用）");
     let (w, h) = available_area(b.name(), scale);
     println!("available_area(px) = {w} x {h}  ← この解像度でラスタ化している");
     std::process::exit(0);
@@ -1426,8 +1456,8 @@ fn clamp_origin(center: f32, v: f32, p: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_fit, content_bbox, parse_key, resolve_scale, viewport_for, Action, Fit, Keymap,
-        ViewState,
+        apply_fit, content_bbox, parse_cell_px, parse_key, resolve_scale, viewport_for, Action,
+        Fit, Keymap, ViewState,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::HashMap;
@@ -1618,6 +1648,15 @@ mod tests {
         apply_fit(Fit::Height, [200.0, 300.0, 600.0, 400.0], 1000.0, 1000.0, 1000, 1000, &mut s);
         assert_eq!(s.zoom, 250);
         assert_eq!(s.center, Some((500.0, 500.0)));
+    }
+
+    #[test]
+    fn parse_cell_px_accepts_xX_and_clamps() {
+        assert_eq!(parse_cell_px("10x17"), Some((10, 17)));
+        assert_eq!(parse_cell_px(" 12 X 24 "), Some((12, 24)));
+        assert_eq!(parse_cell_px("0x999"), Some((1, 128))); // 1..=128 にクランプ
+        assert_eq!(parse_cell_px("8"), None);
+        assert_eq!(parse_cell_px("axb"), None);
     }
 
     #[test]

@@ -12,20 +12,34 @@ use icy_sixel::{sixel_encode, EncodeOptions};
 use vecview_core::OutputBackend;
 
 pub struct SixelBackend {
-    /// tmux passthrough（DCS を二重 ESC でラップ）を使うか。
-    tmux: bool,
+    /// tmux 内かどうか（名前表示用）。
+    in_tmux: bool,
+    /// tmux passthrough（DCS を二重 ESC でラップ）を使うか。tmux がネイティブに sixel を
+    /// 描画できる場合は false にし、生 sixel を tmux に解釈させてペイン内へクリップ描画させる。
+    /// passthrough は tmux が中身を追跡・クリップしないため、画像がペインを越えると物理画面
+    /// 全体（隣ペイン含む）がスクロールして崩れる。ネイティブ対応時はこれを避けられる。
+    passthrough: bool,
 }
 
 impl SixelBackend {
     pub fn new(tmux: bool) -> Self {
-        Self { tmux }
+        // tmux ネイティブ sixel は WT→SSH→tmux 経由だと実画像を再描画できず、プレースホルダ
+        // （"SIXEL IMAGE (WxH)"）になって画が出ないことがある。よって既定は passthrough。
+        // ネイティブが機能する環境では VECVIEW_SIXEL_NATIVE=1 で試せる（要 client_termfeatures に sixel）。
+        let native = tmux
+            && std::env::var_os("VECVIEW_SIXEL_NATIVE").is_some()
+            && tmux_supports_sixel();
+        Self {
+            in_tmux: tmux,
+            passthrough: tmux && !native,
+        }
     }
 
-    /// Sixel の DCS シーケンスを（必要なら tmux ラップして）書き出す。
+    /// Sixel の DCS シーケンスを（必要なら tmux passthrough でラップして）書き出す。
     fn write_sixel(&self, out: &mut impl Write, sixel: &str) -> std::io::Result<()> {
-        if self.tmux {
-            // tmux passthrough: \x1bPtmux; + 内側の ESC を二重化 + \x1b\\。
-            // tmux 側 `set -g allow-passthrough on` が必要。位置追跡はされないため最善努力。
+        if self.passthrough {
+            // 旧 tmux（sixel 非対応ビルド）向け passthrough: \x1bPtmux; + 内側 ESC 二重化 + \x1b\\。
+            // tmux 側 `set -g allow-passthrough on` が必要。位置追跡されずクリップもされない最善努力。
             out.write_all(b"\x1bPtmux;")?;
             for &b in sixel.as_bytes() {
                 if b == 0x1b {
@@ -36,18 +50,32 @@ impl SixelBackend {
             }
             out.write_all(b"\x1b\\")?;
         } else {
+            // 非 tmux、または tmux ネイティブ sixel: 生のまま出す（tmux がペイン内へクリップ描画）。
             out.write_all(sixel.as_bytes())?;
         }
         Ok(())
     }
 }
 
+/// tmux がネイティブに sixel を描画できるか判定する。`client_termfeatures` に `sixel` が
+/// 含まれるのは、tmux ビルドが sixel 対応かつ外側端末も sixel 対応を申告した場合のみ。
+/// 取得できなければ false（＝従来の passthrough にフォールバック）。
+fn tmux_supports_sixel() -> bool {
+    std::process::Command::new("tmux")
+        .args(["display-message", "-p", "#{client_termfeatures}"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("sixel"))
+        .unwrap_or(false)
+}
+
 impl OutputBackend for SixelBackend {
     fn name(&self) -> &str {
-        if self.tmux {
-            "sixel (tmux)"
-        } else {
-            "sixel"
+        match (self.in_tmux, self.passthrough) {
+            (true, true) => "sixel (tmux passthrough)",
+            (true, false) => "sixel (tmux native)",
+            _ => "sixel",
         }
     }
 
