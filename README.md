@@ -1,22 +1,42 @@
 # vecview
 
-ベクターグラフィクス（SVG / Typst）を**ラスタ化せずベクター品質のまま**ターミナルに表示する CLI ツール。
-`lyon` でテッセレーションし、`wgpu`（GPU）で表示解像度に合わせてその都度アンチエイリアス描画するため、
-拡大しても劣化しない。
+ベクターグラフィクス（SVG / Typst / PDF）を**ラスタ化せずベクター品質のまま**ターミナルに表示する CLI ツール。
+SVG / Typst は `lyon` でテッセレーションし `wgpu`（GPU）で表示解像度に合わせてその都度アンチエイリアス描画するため、
+拡大しても劣化しない。PDF は `pdfium` で直接ラスタライズする。
 
 主目的は **nvim で編集する Typst ドキュメントのライブプレビューをターミナル内で完結させること**。
 ブラウザを開かず、保存するたびにターミナル上のプレビューが更新される。
 
+## インストール
+
+```bash
+cargo install --path crates/vecview
+# または: cargo build --release  →  target/release/vecview
+```
+
+### 実行時の依存
+
+| 依存 | 用途 | 備考 |
+|---|---|---|
+| **libpdfium**（`libpdfium.so` / `.dylib` / `.dll`） | PDF 表示・Typst/PDF のテキスト層 | 必須。`pdfium-render` がリンク・ロードする |
+| **typst** | `.typ` のライブプレビュー | `.typ` を渡すときのみ。PATH にあること |
+| **Vulkan ドライバ**（Mesa RADV/ANV 等） | SVG/Typst の GPU 描画 | ヘッドレス wgpu 描画に必要 |
+
+libpdfium のビルド済みバイナリは [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries) から入手できる。
+ライブラリ検索パス（`LD_LIBRARY_PATH` 等）が通る場所に置く。
+
 ## 使い方
 
 ```bash
-vecview <FILE>            # SVG または Typst (.typ)
+vecview <FILE>            # SVG / Typst (.typ) / PDF
 vecview doc.typ           # 内部で `typst watch` を起動し、保存ごとにライブ再描画
-vecview diagram.svg       # SVG を表示（ファイル変更を監視して再描画）
+vecview paper.pdf         # PDF を表示（ファイル変更を監視して再描画）
+vecview diagram.svg       # SVG を表示（任意の SVG ビューアとしても使える）
 
 # オプション
 vecview doc.typ -z 150            # 初期ズーム 150%
-vecview doc.typ -b kitty          # バックエンド強制 [kitty|tmux|framebuffer]
+vecview doc.typ -s 2              # スーパーサンプリング倍率（既定 1）
+vecview doc.typ -b sixel          # バックエンド強制 [kitty|tmux|sixel|framebuffer]
 ```
 
 ### 操作キー（TTY で起動時のインタラクティブモード）
@@ -39,8 +59,8 @@ vecview doc.typ -b kitty          # バックエンド強制 [kitty|tmux|framebu
 
 ズームはページ全体のフィット表示（100%）を基準に、**ページ内の一部を拡大**できる。拡大時は
 キャッシュ画像の拡大ではなく**その解像度でビューポートを再テッセレーション→再描画**するため、
-どれだけ拡大しても劣化しない。矢印で拡大位置をパンする。
-複数ページの Typst 文書はページ送りで閲覧できる。
+どれだけ拡大しても劣化しない（PDF は pdfium が同等にビューポートを再ラスタライズする）。矢印で拡大位置をパンする。
+複数ページの文書はページ送りで閲覧できる。
 
 #### テキスト選択・コピー（copy mode）
 
@@ -64,11 +84,6 @@ vecview doc.typ -b kitty          # バックエンド強制 [kitty|tmux|framebu
 まま、copy mode 突入時に同じ `.typ` を裏で PDF にもコンパイルし、その文字・座標を選択に使う
 （Typst の SVG はグリフがパス化され文字を持たないため）。単体 `.svg` はテキスト層を持たない。
 
-- `.typ` を渡すと `typst watch <file> <tmp>-{p}.svg` を起動し、1ページ目の SVG を監視・表示する。
-  `typst` が PATH にあること。
-- `.svg` を渡すとそのファイルを直接監視する（任意の SVG ビューアとしても使える）。
-- 終了は `Ctrl-C`。
-
 ### nvim との組み合わせ
 
 tmux の別ペインで `vecview doc.typ` を起動しておけば、nvim で `doc.typ` を編集・保存するたびに
@@ -76,21 +91,45 @@ tmux の別ペインで `vecview doc.typ` を起動しておけば、nvim で `d
 
 ## 出力バックエンド
 
-| バックエンド | 対象 | 備考 |
+| バックエンド | 対象端末 | 備考 |
 |---|---|---|
 | `kitty` | Ghostty / kitty / WezTerm | Kitty Graphics Protocol（RGBA 直接転送） |
-| `kitty (tmux passthrough)` | tmux 内の上記端末 | DCS passthrough でラップ。tmux 設定が必要（下記） |
+| `kitty (tmux placeholder)` | tmux 内の上記端末 | Unicode プレースホルダ＋DCS passthrough でペイン内に正しく配置 |
+| `sixel` | Sixel 対応端末（Windows Terminal / xterm / foot / mlterm 等） | Kitty 非対応端末向け。256 色に減色 |
+| `sixel (tmux passthrough / native)` | tmux 内の Sixel 端末 | tmux が sixel 対応なら native、非対応なら passthrough |
 | `framebuffer` | Linux bare TTY / 組み込み | `/dev/fb0` へ直接描画。ネイティブ解像度でベクター品質が最大限活きる |
 
-起動時に環境変数と TTY 状態から自動選択する。`--backend` で強制も可能。
+起動時に環境変数と TTY 状態から自動選択する。`--backend`（または `VECVIEW_BACKEND`）で強制も可能。
 
 ### tmux で使う場合
 
-Kitty グラフィクスを tmux 経由で通すには passthrough を有効化する：
+Kitty / Sixel グラフィクスを tmux 経由で通すには passthrough を有効化する：
 
 ```tmux
 set -g allow-passthrough on
 ```
+
+tmux の Sixel をネイティブに使う場合は、端末の sixel 対応を tmux に認識させる：
+
+```tmux
+set -as terminal-features '*:sixel'
+```
+
+### 環境変数
+
+| 変数 | 既定 | 説明 |
+|---|---|---|
+| `VECVIEW_BACKEND` | 自動検出 | バックエンド強制 `[kitty\|tmux\|sixel\|framebuffer]` |
+| `VECVIEW_SCALE` | `1` | スーパーサンプリング倍率（1..=4）。`-s` でも指定可。高倍率はシャープだが転送量が倍率²で増える |
+| `VECVIEW_CELL_PX` | `8x16` | 端末がピクセル寸法を報告しないとき（SSH+tmux 等）の概算セルサイズ `幅x高`。表示が縮む/はみ出す場合に調整 |
+| `VECVIEW_MIN_FRAME_MS` | `200`（tmux 経由）/ `80`（直接） | 連続入力中の画像転送の最小間隔（ms）。小さいほど滑らかだが端末を追い越すと不安定になる |
+| `VECVIEW_REDRAW_MS` | `1000` | tmux passthrough sixel を tmux 再描画から復元するための再送間隔（ms） |
+| `VECVIEW_SIXEL_NATIVE` | 無効 | `1` で tmux ネイティブ sixel を試す（要 `client_termfeatures` に sixel） |
+| `VECVIEW_PROBE` | 無効 | `1` で端末が報告するサイズと描画解像度を表示して終了（解像度調査用） |
+
+> 補足: tmux 経由の Kitty / Sixel はターミナルプロトコル上、画像の高頻度更新に弱い端末がある。
+> ズーム/パンの連打で表示が乱れる・端末が不安定になる場合は `VECVIEW_SCALE=1`（既定）に加えて
+> `VECVIEW_MIN_FRAME_MS` を大きめ（例 `300`）にすると安定する。
 
 ### Framebuffer で使う場合
 
@@ -106,10 +145,11 @@ set -g allow-passthrough on
 .svg ─────────────────┘                                      │
                                                              ▼
                             wgpu（オフスクリーン・MSAA・表示解像度）──> RGBA
+.pdf ──pdfium──(ビューポート再ラスタライズ)─────────────────────> RGBA
                                                              │
-                          ┌──────────────────────────────────┤
-                          ▼                                   ▼
-                 Kitty Graphics Protocol              /dev/fb0 直接描画
+                          ┌──────────────────────┬───────────┴──────────┐
+                          ▼                       ▼                      ▼
+                Kitty Graphics Protocol         Sixel            /dev/fb0 直接描画
 ```
 
 クレート構成（Cargo workspace）：
@@ -120,23 +160,28 @@ set -g allow-passthrough on
 | `vecview-core` | フォーマット非依存の抽象（`Document` / `OutputBackend` / `Page` / `PathData`） |
 | `vecview-svg` | `usvg` で SVG をパースし `Page` に変換（曲線情報を保持） |
 | `vecview-renderer` | `lyon` テッセレーション + `wgpu` ヘッドレス描画 + RGBA 読み戻し |
-| `vecview-output` | バックエンド検出と Kitty / Framebuffer 実装 |
-| `vecview-pdf` | PDF 対応（未実装・予定） |
+| `vecview-pdf` | `pdfium` で PDF を直接ラスタライズ・テキスト層抽出 |
+| `vecview-output` | バックエンド検出と Kitty / Sixel / Framebuffer 実装 |
 
 ## ビルドと検証
 
 ```bash
 cargo build
-cargo test         # blit 変換・アスペクト計算・GPU 描画のスモークテスト
+cargo test                 # blit 変換・アスペクト計算・GPU 描画のスモークテスト等
 cargo clippy --all-targets
 ```
 
 GPU 描画のヘッドレス動作には Vulkan ドライバ（Mesa RADV/ANV 等）が必要。
 
-## 現状（初回スコープ）と今後
+## 現状と今後
 
-実装済み：SVG / Typst の表示、ファイル変更でのライブ再描画、Kitty（+tmux placeholder）/ Framebuffer 出力、
-ベクター品質の高解像度描画、インタラクティブなズーム / 複数ページ送り、tmux ペイン内への正しい配置。
+実装済み：SVG / Typst / PDF の表示、ファイル変更でのライブ再描画、Kitty（+tmux placeholder）/ Sixel（+tmux）/
+Framebuffer 出力、ベクター品質の高解像度描画、インタラクティブなズーム / 複数ページ送り、テキスト選択・コピー、
+tmux ペイン内への正しい配置・ウィンドウ切替や多重起動への対応。
 
-未対応（予定）：グラデーション / クリップパスの忠実な描画、PDF 対応、Framebuffer の実機表示確認、
-Sixel フォールバック。
+未対応 / 既知の制約：グラデーション / クリップパスの忠実な描画、Framebuffer の実機表示確認、
+一部端末での高頻度画像更新の安定性（上記の環境変数で緩和）。
+
+## ライセンス
+
+Apache License 2.0 — 詳細は [LICENSE](LICENSE) を参照。Copyright 2026 Mitsuaki Takeuchi.
