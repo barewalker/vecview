@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
@@ -123,8 +123,9 @@ struct Args {
     #[arg(short, long)]
     backend: Option<String>,
 
-    /// スーパーサンプリング倍率（1..=4）。tmux 表示のシャープさと引き換えに転送量が増える。
-    /// 未指定なら環境変数 VECVIEW_SCALE、それも無ければ 2。
+    /// スーパーサンプリング倍率（1..=4）。tmux 表示のシャープさと引き換えに転送量が倍率²で増え、
+    /// 連続操作で端末が画像更新を捌けず落ちることがある。未指定なら環境変数 VECVIEW_SCALE、
+    /// それも無ければ 1（等倍）。端末が耐えるなら 2 以上でシャープに。
     #[arg(short, long)]
     scale: Option<u32>,
 }
@@ -273,6 +274,8 @@ fn main() -> Result<()> {
     // 最後に描画した (ページ, mtime)。描画のたびに SVG を読むと atime が変わり notify が
     // 再発火する（自己トリガー）ため、同一ページで mtime 不変なら描画しない。
     let mut last_render: Option<(usize, SystemTime)> = None;
+    // copy mode のキャレット移動で使い回す、選択オーバーレイ適用前のベース画像。
+    let mut base_frame: Option<BaseFrame> = None;
 
     // 初回描画（.typ は生成待ちのため存在しないことがある）。
     render_current(
@@ -282,6 +285,7 @@ fn main() -> Result<()> {
         renderer.as_ref(),
         backend.as_ref(),
         &mut last_render,
+        &mut base_frame,
     );
 
     // tmux passthrough sixel は tmux に消されるため、入力待ちをタイムアウトさせて定期的に
@@ -292,34 +296,66 @@ fn main() -> Result<()> {
         None
     };
 
+    // 画像転送のレート制限。キー長押し（ズーム/パン/キャレット）で毎フレーム大きな画像を
+    // 端末へ流すと、生成側が消費側（特に tmux 経由の端末）を追い越して入力バッファが溢れ、
+    // 端末ごとクラッシュする。連続入力中は最大 1/MIN_FRAME に間引き、入力が止んだら最終状態を
+    // 1回描く（デバウンス）。間隔は VECVIEW_MIN_FRAME_MS（既定 80ms ≒ 12fps、最小 16ms）。
+    // tmux passthrough 経由（placeholder / sixel）は転送が重く端末側に画像が溜まりやすいので
+    // 既定をより保守的に。直接配置はネイティブで軽いため小さめでよい。
+    let min_frame_default = if backend.name().contains("placeholder") || backend.name().contains("tmux") {
+        200
+    } else {
+        80
+    };
+    let min_frame = Duration::from_millis(min_frame_ms(min_frame_default));
+    let mut last_draw: Option<Instant> = None;
+    let mut pending_full = false; // フル再描画（GPU 再ラスタライズ）が保留中。
+    let mut pending_overlay = false; // overlay 軽量再描画が保留中。
+    let mut last_sixel = Instant::now(); // sixel 定期再描画の前回時刻。
+
+    // tmux placeholder kitty は別ウィンドウへ切り替えると、端末が画像を tmux のウィンドウ単位で
+    // クリップしないため、画像が前面ウィンドウのペインに残ってしまう。自ウィンドウが可視かを
+    // 定期ポーリングし、隠れたら画像を消し、戻ったら再描画する。$TMUX_PANE の window_active で判定。
+    let kitty_ph = backend.name().contains("placeholder");
+    let vis_pane = std::env::var("TMUX_PANE").ok();
+    let vis_poll = Duration::from_millis(250);
+    let mut last_vis_poll = Instant::now();
+    let mut was_visible = true;
+
     loop {
-        let first = match refresh {
+        // 次の入力待ち時間：sixel 定期再描画・可視ポーリング・間引き中の保留描画の締切のうち最短。
+        let wait = {
+            let mut w = refresh;
+            if pending_full || pending_overlay {
+                let remaining = last_draw
+                    .map(|t| min_frame.saturating_sub(Instant::now().duration_since(t)))
+                    .unwrap_or(Duration::ZERO);
+                w = Some(w.map_or(remaining, |x| x.min(remaining)));
+            }
+            if kitty_ph && vis_pane.is_some() {
+                let remaining = vis_poll.saturating_sub(Instant::now().duration_since(last_vis_poll));
+                w = Some(w.map_or(remaining, |x| x.min(remaining)));
+            }
+            w
+        };
+
+        // 入力を受信（待ち時間ありならタイムアウト）。タイムアウト時は msgs 空で描画判定へ進む。
+        let msgs: Vec<Msg> = match wait {
             Some(d) => match rx.recv_timeout(d) {
-                Ok(m) => m,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // ヘルプ表示中は通常テキスト（tmux 追跡済み）なので画像を再送しない。
-                    if !state.help {
-                        let _ = backend.redraw();
-                    }
-                    continue;
-                }
+                Ok(first) => drain_burst(first, &rx),
+                Err(mpsc::RecvTimeoutError::Timeout) => Vec::new(),
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             },
             None => match rx.recv() {
-                Ok(m) => m,
+                Ok(first) => drain_burst(first, &rx),
                 Err(_) => break,
             },
         };
-        // バーストをまとめて取り出す。連続する Reload は1回の描画に集約し、Quit/キーが
-        // Reload の後ろに積まれても取りこぼさない（高頻度の再変換で反応不能・点滅になるのを防ぐ）。
-        let mut msgs = vec![first];
-        while let Ok(m) = rx.try_recv() {
-            msgs.push(m);
-        }
 
         let mut quit = false;
         let mut reload = false;
-        let mut dirty = false; // キー操作などで通常表示の再描画が必要。
+        let mut dirty = false; // キー操作などで通常表示のフル再描画（GPU 再ラスタライズ）が必要。
+        let mut overlay_only = false; // copy mode のキャレット/選択のみ変化＝ベース画像を使い回す軽量再描画。
         let mut help_changed = false; // ヘルプの表示/非表示が切り替わった。
 
         let pages = current_page_count(&source, pdf_doc.as_ref());
@@ -341,12 +377,12 @@ fn main() -> Result<()> {
                                 let n = text.chars().count();
                                 copy_to_clipboard(&text);
                                 state.status = Some(format!("copied {n} chars"));
-                                dirty = true; // cm は戻さない＝抜ける。
+                                overlay_only = true; // cm は戻さない＝抜ける。view 不変なので軽量再描画。
                             }
-                            CopyOutcome::Exit => dirty = true,
+                            CopyOutcome::Exit => overlay_only = true,
                             CopyOutcome::Redraw => {
                                 state.copy = Some(cm);
-                                dirty = true;
+                                overlay_only = true; // キャレット/選択のみ変化＝ GPU 再描画しない。
                             }
                             CopyOutcome::Ignore => state.copy = Some(cm),
                         }
@@ -414,7 +450,7 @@ fn main() -> Result<()> {
                             if let Some(idx) = mouse_to_glyph(&state, m.column, m.row) {
                                 if let Some(cm) = state.copy.as_mut() {
                                     cm.cursor = idx;
-                                    dirty = true;
+                                    overlay_only = true; // 選択のみ変化＝軽量再描画。
                                 }
                             }
                         }
@@ -431,7 +467,7 @@ fn main() -> Result<()> {
                                 } else {
                                     state.copy = Some(cm);
                                 }
-                                dirty = true;
+                                overlay_only = true; // view 不変＝軽量再描画。
                             }
                         }
                         _ => {}
@@ -481,23 +517,92 @@ fn main() -> Result<()> {
             }
         }
 
-        // 描画判定。ヘルプ表示中は通常描画を抑止し（Reload が来ても画像で上書きしない＝点滅
-        // 防止。再オープン自体は実行済みなので閉じれば最新が出る）、切り替わった時だけ描き直す。
+        // 今イテレーションで必要になった描画を保留フラグへ畳み込む（実描画はレート制限つきで後段）。
+        if dirty {
+            pending_full = true;
+        }
+        if overlay_only {
+            pending_overlay = true;
+        }
+        // ヘルプを閉じた直後は画像を描き直す必要がある。
+        if help_changed && !state.help {
+            pending_full = true;
+        }
+
+        // 描画判定。ヘルプ表示中は画像描画を抑止し（点滅防止。閉じれば最新が出る）、
+        // 画像描画は min_frame で間引いて端末を追い越さないようにする（フラッド＝クラッシュ防止）。
         if state.help {
             if help_changed {
                 draw_help(backend.as_ref(), &keymap);
             }
-        } else if dirty || help_changed {
-            render_current(
-                &source,
-                pdf_doc.as_ref(),
-                &mut state,
-                renderer.as_ref(),
-                backend.as_ref(),
-                &mut last_render,
-            );
-            // copy mode のステータス/操作ヒントを最下行に出す。
-            draw_overlay_text(backend.as_ref(), &mut state);
+            // 表示中は溜めない（閉じた時に help_changed で再セットされる）。
+            pending_full = false;
+            pending_overlay = false;
+        } else if (pending_full || pending_overlay) && (!kitty_ph || was_visible) {
+            // 自ウィンドウが隠れている間は描かない（前面ウィンドウへ画像が残るのを防ぐ）。
+            // 保留は残し、戻って可視になったときに描く。
+            let now = Instant::now();
+            let can_draw = last_draw.is_none_or(|t| now.duration_since(t) >= min_frame);
+            if can_draw {
+                if pending_full {
+                    render_current(
+                        &source,
+                        pdf_doc.as_ref(),
+                        &mut state,
+                        renderer.as_ref(),
+                        backend.as_ref(),
+                        &mut last_render,
+                        &mut base_frame,
+                    );
+                } else if !redraw_overlay(backend.as_ref(), &state, &base_frame) {
+                    // copy mode の軽量再描画。キャッシュが無ければフル描画にフォールバック。
+                    render_current(
+                        &source,
+                        pdf_doc.as_ref(),
+                        &mut state,
+                        renderer.as_ref(),
+                        backend.as_ref(),
+                        &mut last_render,
+                        &mut base_frame,
+                    );
+                }
+                // copy mode のステータス/操作ヒントを最下行に出す。
+                draw_overlay_text(backend.as_ref(), &mut state);
+                last_draw = Some(now);
+                pending_full = false;
+                pending_overlay = false;
+            }
+            // can_draw でなければ保留のまま。wait が締切で起こすので次イテレーションで描く。
+        }
+
+        // sixel 定期再描画（tmux に消された画像の復元）。描画レートとは独立に refresh 間隔で。
+        if let Some(r) = refresh {
+            let now = Instant::now();
+            if !state.help && now.duration_since(last_sixel) >= r {
+                let _ = backend.redraw();
+                last_sixel = now;
+            }
+        }
+
+        // 可視ポーリング（tmux placeholder のウィンドウ間残留対策）。隠れたら画像を消し、戻ったら再描画。
+        if kitty_ph {
+            if let Some(pane) = vis_pane.as_deref() {
+                let now = Instant::now();
+                if now.duration_since(last_vis_poll) >= vis_poll {
+                    last_vis_poll = now;
+                    if let Some(visible) = pane_window_active(pane) {
+                        if !visible && was_visible {
+                            // 別ウィンドウへ切替：転送済み画像を消して前面への残留を止める。
+                            let _ = backend.clear();
+                            was_visible = false;
+                        } else if visible && !was_visible {
+                            // 戻ってきた：再描画して画像を復元する。
+                            was_visible = true;
+                            pending_full = true;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1129,6 +1234,28 @@ fn draw_overlay_text(backend: &dyn OutputBackend, state: &mut ViewState) {
     }
 }
 
+/// copy mode のキャレット移動時に GPU 再ラスタライズを避けるためのベース画像キャッシュ
+/// （選択オーバーレイ適用前）。キーがすべて copy mode に消費され view が変わらない copy mode
+/// 中だけ使い回す。複雑な図を毎キー再描画すると GPU を酷使し端末ごと巻き込んで落ちうるため。
+struct BaseFrame {
+    out_w: u32,
+    out_h: u32,
+    viewport: [f32; 4],
+    rgba: Vec<u8>,
+}
+
+/// copy mode のキャレット/選択のみ変化したときの軽量再描画。直近のベース画像を使い回し、
+/// 選択オーバーレイだけ重ねて表示する（GPU 再描画・SVG 再読込なし）。キャッシュが無ければ
+/// false を返し、呼び出し側はフル描画にフォールバックする。
+fn redraw_overlay(backend: &dyn OutputBackend, state: &ViewState, base: &Option<BaseFrame>) -> bool {
+    let Some(bf) = base else { return false };
+    let mut rgba = bf.rgba.clone();
+    if let Some(cm) = &state.copy {
+        overlay_selection(&mut rgba, bf.out_w, bf.out_h, bf.viewport, cm);
+    }
+    backend.display(&rgba, bf.out_w, bf.out_h).is_ok()
+}
+
 /// 現在ページを描画して表示する。PDF は pdfium、SVG/Typst は GPU レンダラー。
 /// 失敗（ファイル未生成等）時は静かにスキップ。
 fn render_current(
@@ -1138,11 +1265,12 @@ fn render_current(
     renderer: Option<&Renderer>,
     backend: &dyn OutputBackend,
     last_render: &mut Option<(usize, SystemTime)>,
+    base: &mut Option<BaseFrame>,
 ) {
     match source {
         Source::Pdf { .. } => {
             let Some(doc) = pdf else { return };
-            if let Err(e) = render_pdf(doc, backend, state) {
+            if let Err(e) = render_pdf(doc, backend, state, base) {
                 eprintln!("vecview: 描画エラー: {e:#}");
             }
         }
@@ -1152,7 +1280,7 @@ fn render_current(
                 return;
             }
             let Some(renderer) = renderer else { return };
-            match render_and_display(&path, renderer, backend, state) {
+            match render_and_display(&path, renderer, backend, state, base) {
                 Ok(()) => *last_render = mtime_of(&path).map(|m| (state.page, m)),
                 Err(e) => eprintln!("vecview: 描画エラー: {e:#}"),
             }
@@ -1165,6 +1293,7 @@ fn render_pdf(
     pdf: &vecview_pdf::Pdf,
     backend: &dyn OutputBackend,
     state: &mut ViewState,
+    base: &mut Option<BaseFrame>,
 ) -> Result<()> {
     let (pw, ph) = pdf.page_size(state.page)?;
     let (pw, ph) = (pw.max(1.0), ph.max(1.0));
@@ -1187,6 +1316,10 @@ fn render_pdf(
     state.last_viewport = Some(viewport);
 
     let mut rgba = pdf.render(state.page, viewport, out_w, out_h)?;
+    // copy mode 中はオーバーレイ適用前のベースをキャッシュ（以降のキャレット移動で使い回す）。
+    if state.copy.is_some() {
+        *base = Some(BaseFrame { out_w, out_h, viewport, rgba: rgba.clone() });
+    }
     if let Some(cm) = &state.copy {
         overlay_selection(&mut rgba, out_w, out_h, viewport, cm);
     }
@@ -1240,6 +1373,7 @@ fn render_and_display(
     renderer: &Renderer,
     backend: &dyn OutputBackend,
     state: &mut ViewState,
+    base: &mut Option<BaseFrame>,
 ) -> Result<()> {
     let doc = SvgDocument::open(
         svg_path
@@ -1270,6 +1404,10 @@ fn render_and_display(
     state.last_viewport = Some(viewport);
 
     let mut rgba = renderer.render(&page, out_w, out_h, viewport)?;
+    // copy mode 中はオーバーレイ適用前のベースをキャッシュ（以降のキャレット移動で使い回す）。
+    if state.copy.is_some() {
+        *base = Some(BaseFrame { out_w, out_h, viewport, rgba: rgba.clone() });
+    }
     if let Some(cm) = &state.copy {
         overlay_selection(&mut rgba, out_w, out_h, viewport, cm);
     }
@@ -1283,7 +1421,8 @@ fn render_and_display(
 /// 概算セルサイズ(8x16) に頼るしかない。実セルサイズが概算より大きい環境（HiDPI 等）では
 /// この低解像度のまま端末側で引き伸ばされてボケる。そこでプレースホルダ時のみ高解像度で
 /// ラスタ化し、端末側の縮小でシャープにする（スーパーサンプリング）。倍率は VECVIEW_SCALE
-/// （`scale`、既定2、1..=4）。直接配置(a=T)やフレームバッファはネイティブ画素表示なので等倍に保つ。
+/// （`scale`、既定1=等倍、1..=4）。高倍率は転送量が倍率²で増え連続操作で端末が落ちうるため既定は
+/// 等倍。直接配置(a=T)やフレームバッファはネイティブ画素表示なので常に等倍に保つ。
 fn available_area(backend_name: &str, scale: u32) -> (u32, u32) {
     if backend_name.starts_with("framebuffer") {
         if let Some(sz) = read_fb_virtual_size() {
@@ -1328,6 +1467,41 @@ fn fallback_cell_px() -> (u32, u32) {
         .unwrap_or((8, 16))
 }
 
+/// 指定 tmux ペインの属するウィンドウが現在アクティブ（前面表示中）か。判定不能なら None。
+/// tmux placeholder kitty で、別ウィンドウへ切り替わったとき画像を消すための可視判定に使う。
+fn pane_window_active(pane: &str) -> Option<bool> {
+    let out = Command::new("tmux")
+        .args(["display-message", "-p", "-t", pane, "#{window_active}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim() == "1")
+}
+
+/// 受信した先頭メッセージに、チャネルに既に積まれている分をまとめて足してバーストにする。
+/// 連続する Reload/キーを1回の描画へ集約し、Quit が後ろに積まれても取りこぼさない。
+fn drain_burst(first: Msg, rx: &mpsc::Receiver<Msg>) -> Vec<Msg> {
+    let mut msgs = vec![first];
+    while let Ok(m) = rx.try_recv() {
+        msgs.push(m);
+    }
+    msgs
+}
+
+/// 連続入力中の画像転送の最小間隔（ms）。`VECVIEW_MIN_FRAME_MS` で上書き、最小 16。短いほど
+/// 追従が滑らかだが、端末を追い越してクラッシュさせるリスクが上がる。既定はバックエンド依存
+/// （`default`）：tmux passthrough（kitty placeholder / sixel）は転送が重く端末側に溜まりやすい
+/// ため保守的に、直接配置はネイティブで軽いため小さめにする。
+fn min_frame_ms(default: u64) -> u64 {
+    std::env::var("VECVIEW_MIN_FRAME_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|v| v.max(16))
+        .unwrap_or(default)
+}
+
 /// passthrough sixel の定期再描画間隔（ms）。`VECVIEW_REDRAW_MS` で上書き、既定 1000、最小 100。
 /// 短いほど消えてから復元するまでが速いが、その分 sixel 再送の転送量が増える。
 fn redraw_interval_ms() -> u64 {
@@ -1346,15 +1520,17 @@ fn parse_cell_px(s: &str) -> Option<(u32, u32)> {
     Some((w.clamp(1, 128), h.clamp(1, 128)))
 }
 
-/// スーパーサンプリング倍率を決める。優先順位は CLI 引数 > 環境変数 VECVIEW_SCALE > 既定2。
-/// いずれも 1..=4 にクランプする。
+/// スーパーサンプリング倍率を決める。優先順位は CLI 引数 > 環境変数 VECVIEW_SCALE > 既定1。
+/// いずれも 1..=4 にクランプする。既定を 1（等倍）にしているのは、tmux placeholder 経路で
+/// 高倍率にすると 1 フレームの転送量が倍率²で増え、連続操作で端末（Ghostty 等）が画像更新を
+/// 捌ききれずクラッシュしやすくなるため。シャープさが欲しく端末が耐える環境では 2 以上を指定する。
 fn resolve_scale(arg: Option<u32>) -> u32 {
     arg.or_else(|| {
         std::env::var("VECVIEW_SCALE")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
     })
-    .unwrap_or(2)
+    .unwrap_or(1)
     .clamp(1, 4)
 }
 

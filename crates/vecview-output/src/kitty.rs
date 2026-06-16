@@ -28,20 +28,35 @@ fn zlib_compress(data: &[u8]) -> Vec<u8> {
 /// base64 ペイロードの1チャンク最大長（Kitty 推奨の 4096 バイト）。
 const CHUNK: usize = 4096;
 
-/// プレースホルダで使う画像 ID。前景色で符号化するため 1..=255 に収める。
-const IMAGE_ID: u32 = 1;
-
 /// Unicode プレースホルダ文字 U+10EEEE。
 const PLACEHOLDER: char = '\u{10EEEE}';
 
 pub struct KittyBackend {
     /// tmux passthrough（＋プレースホルダ配置）を使うか。
     tmux: bool,
+    /// この vecview インスタンス固有の画像 ID。Kitty の画像 ID は端末でグローバルなので、
+    /// 複数ウィンドウで複数の vecview が動くと固定 ID では互いに上書き・誤削除し合う。PID から
+    /// 一意な 24bit 値を作り、プレースホルダの前景色（24bit トゥルーカラー）で符号化する。
+    image_id: u32,
 }
 
 impl KittyBackend {
     pub fn new(tmux: bool) -> Self {
-        Self { tmux }
+        // PID を 24bit に収めて一意 ID とする（0 は避ける）。24bit なのでプレースホルダの
+        // 最上位バイト用 diacritic は不要。並行する別インスタンスと衝突する確率は実質ゼロ。
+        let image_id = (std::process::id() & 0x00FF_FFFF).max(1);
+        Self { tmux, image_id }
+    }
+
+    /// 自インスタンスの画像を削除する APC 本体。tmux placeholder では他インスタンスの画像を
+    /// 巻き込まないよう自分の ID だけ消す（d=I,i=...）。非 tmux 直接配置は単一端末でグローバル
+    /// 衝突しないため全削除でよい（自動採番 ID を使い ID を持たないため）。
+    fn delete_body(&self) -> Vec<u8> {
+        if self.tmux {
+            format!("_Ga=d,d=I,i={}", self.image_id).into_bytes()
+        } else {
+            b"_Ga=d".to_vec()
+        }
     }
 
     /// APC グラフィクスシーケンスを（必要なら tmux ラップして）書き出す。
@@ -95,7 +110,8 @@ impl KittyBackend {
 
     /// 直接配置（非 tmux）：前画像を削除→クリア→カーソル位置に表示。
     fn display_direct(&self, out: &mut impl Write, rgba: &[u8], w: u32, h: u32) -> std::io::Result<()> {
-        self.write_apc(out, b"_Ga=d")?;
+        let del = self.delete_body();
+        self.write_apc(out, &del)?;
         out.write_all(b"\x1b[2J\x1b[H")?;
         self.transmit(out, rgba, &format!("a=T,q=2,f=32,s={w},v={h}"))?;
         Ok(())
@@ -109,15 +125,24 @@ impl KittyBackend {
         // 画面（ペイン）をクリアし左上へ。これで前フレームのプレースホルダセルも消える。
         out.write_all(b"\x1b[2J\x1b[H")?;
 
-        // 仮想配置（U=1）として転送。c/r が画像の占有セル数。
+        // 前フレームの自分の画像とその placement を削除して解放する（d=I,i=自ID）。2J はテキスト
+        // しか消さず Kitty 画像/placement は残るため、削除しないと再描画のたびに端末側へ画像が
+        // 溜まり続け、copy mode のキャレット連打などでメモリが膨張して端末が落ちる。自 ID だけ
+        // 消すので、別ウィンドウの別 vecview の画像は巻き込まない。
+        let del = self.delete_body();
+        self.write_apc(out, &del)?;
+
+        // 仮想配置（U=1）として転送。c/r が画像の占有セル数。i は自インスタンス固有 ID。
+        let id = self.image_id;
         self.transmit(
             out,
             rgba,
-            &format!("a=T,q=2,U=1,i={IMAGE_ID},f=32,s={w},v={h},c={cols},r={rows}"),
+            &format!("a=T,q=2,U=1,i={id},f=32,s={w},v={h},c={cols},r={rows}"),
         )?;
 
-        // 前景色で画像 ID を符号化（id<=255 なので 256 色指定）。
-        write!(out, "\x1b[38;5;{IMAGE_ID}m")?;
+        // 前景色で画像 ID を 24bit トゥルーカラーとして符号化（id = r<<16 | g<<8 | b）。
+        let (r, g, b) = ((id >> 16) & 0xff, (id >> 8) & 0xff, id & 0xff);
+        write!(out, "\x1b[38;2;{r};{g};{b}m")?;
         let mut buf = [0u8; 4];
         for y in 0..rows {
             // 行頭へ（tmux ではペイン相対のカーソル移動）。
@@ -156,17 +181,20 @@ impl OutputBackend for KittyBackend {
 
     fn leave(&self) -> Result<()> {
         let mut out = std::io::stdout().lock();
-        // 念のため転送済み画像を全削除してから、カーソル表示・代替スクリーン解除。
-        self.write_apc(&mut out, b"_Ga=d")?;
+        // 転送済みの自分の画像を削除してから、カーソル表示・代替スクリーン解除。自 ID だけ消すので
+        // 別ウィンドウの別 vecview の画像は残る。
+        let del = self.delete_body();
+        self.write_apc(&mut out, &del)?;
         out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1049l")?;
         out.flush()?;
         Ok(())
     }
 
     fn clear(&self) -> Result<()> {
-        // 画面クリアだけでは Kitty 画像（直接配置）が残るため、先に全画像を削除する。
+        // 画面クリアだけでは Kitty 画像が残るため、先に自分の画像を削除する（他インスタンスは温存）。
         let mut out = std::io::stdout().lock();
-        self.write_apc(&mut out, b"_Ga=d")?;
+        let del = self.delete_body();
+        self.write_apc(&mut out, &del)?;
         out.write_all(b"\x1b[2J\x1b[H")?;
         out.flush()?;
         Ok(())
