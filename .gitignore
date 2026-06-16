@@ -1,2 +1,5 @@
 /target
 **/*.rs.bk
+
+# 内部の実装指示書（公開しない。ローカルには残す）
+/vecview_instructions.md
