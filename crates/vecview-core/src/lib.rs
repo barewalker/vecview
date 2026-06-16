@@ -129,4 +129,17 @@ pub trait OutputBackend {
         out.flush()?;
         Ok(())
     }
+
+    /// 直近に表示した画像を再送する。tmux passthrough sixel は tmux に追跡されず、tmux が
+    /// ペインを再描画（ステータス更新・他ペイン活動など）すると画像が消えるため、その復元に
+    /// 使う。新たなラスタライズはせずキャッシュ済みフレームを再出力する。デフォルトは何もしない。
+    fn redraw(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// メインループが定期的に [`redraw`](Self::redraw) を呼ぶべきか。外部要因で画像が勝手に
+    /// 消える方式（tmux passthrough sixel）のみ true。デフォルト false。
+    fn wants_periodic_redraw(&self) -> bool {
+        false
+    }
 }

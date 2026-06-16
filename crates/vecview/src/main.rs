@@ -284,7 +284,32 @@ fn main() -> Result<()> {
         &mut last_render,
     );
 
-    while let Ok(first) = rx.recv() {
+    // tmux passthrough sixel は tmux に消されるため、入力待ちをタイムアウトさせて定期的に
+    // 直近フレームを再送し復元する。間隔は VECVIEW_REDRAW_MS（既定 1000ms、最小 100ms）。
+    let refresh = if backend.wants_periodic_redraw() {
+        Some(Duration::from_millis(redraw_interval_ms()))
+    } else {
+        None
+    };
+
+    loop {
+        let first = match refresh {
+            Some(d) => match rx.recv_timeout(d) {
+                Ok(m) => m,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // ヘルプ表示中は通常テキスト（tmux 追跡済み）なので画像を再送しない。
+                    if !state.help {
+                        let _ = backend.redraw();
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() {
+                Ok(m) => m,
+                Err(_) => break,
+            },
+        };
         // バーストをまとめて取り出す。連続する Reload は1回の描画に集約し、Quit/キーが
         // Reload の後ろに積まれても取りこぼさない（高頻度の再変換で反応不能・点滅になるのを防ぐ）。
         let mut msgs = vec![first];
@@ -1301,6 +1326,16 @@ fn fallback_cell_px() -> (u32, u32) {
         .ok()
         .and_then(|s| parse_cell_px(&s))
         .unwrap_or((8, 16))
+}
+
+/// passthrough sixel の定期再描画間隔（ms）。`VECVIEW_REDRAW_MS` で上書き、既定 1000、最小 100。
+/// 短いほど消えてから復元するまでが速いが、その分 sixel 再送の転送量が増える。
+fn redraw_interval_ms() -> u64 {
+    std::env::var("VECVIEW_REDRAW_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|v| v.max(100))
+        .unwrap_or(1000)
 }
 
 /// "幅x高"（区切りは `x` または `X`）を (幅, 高) に解析。各値は 1..=128 にクランプ。

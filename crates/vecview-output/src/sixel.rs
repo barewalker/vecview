@@ -5,6 +5,7 @@
 //! フルカラーと違い 256 色パレットに落ちるため、アンチエイリアスの縁やグラデーションは
 //! わずかに階調が減る。等倍画素表示なのでスーパーサンプリングはしない。
 
+use std::cell::RefCell;
 use std::io::Write;
 
 use anyhow::{anyhow, Result};
@@ -19,6 +20,12 @@ pub struct SixelBackend {
     /// passthrough は tmux が中身を追跡・クリップしないため、画像がペインを越えると物理画面
     /// 全体（隣ペイン含む）がスクロールして崩れる。ネイティブ対応時はこれを避けられる。
     passthrough: bool,
+    /// 直近に表示した sixel（icy_sixel の出力）。passthrough 時に tmux が消した画像を
+    /// 再ラスタライズせず復元するためのキャッシュ。display() のたびに更新する。
+    last: RefCell<Option<String>>,
+    /// vecview 自身の tmux ペイン ID（$TMUX_PANE）。passthrough 時にこのペインがアクティブ
+    /// （フォーカス中）かを判定し、非アクティブ時は描画を抑止するのに使う。
+    pane: Option<String>,
 }
 
 impl SixelBackend {
@@ -32,7 +39,29 @@ impl SixelBackend {
         Self {
             in_tmux: tmux,
             passthrough: tmux && !native,
+            last: RefCell::new(None),
+            pane: std::env::var("TMUX_PANE").ok(),
         }
+    }
+
+    /// passthrough 時、自分のペインがアクティブ（フォーカス中）か。passthrough sixel は物理
+    /// カーソル位置に描かれ、tmux はフォーカス中のペインにしか物理カーソルを合わせないため、
+    /// 非アクティブだと画像が別ペインに描かれてしまう。その間は出力を抑止する。tmux 外や
+    /// 判定不能時は true（常に描く）。
+    fn pane_is_active(&self) -> bool {
+        if !self.passthrough {
+            return true;
+        }
+        let Some(pane) = self.pane.as_deref() else {
+            return true;
+        };
+        std::process::Command::new("tmux")
+            .args(["display-message", "-p", "-t", pane, "#{pane_active}"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+            .unwrap_or(true)
     }
 
     /// Sixel の DCS シーケンスを（必要なら tmux passthrough でラップして）書き出す。
@@ -99,6 +128,8 @@ impl OutputBackend for SixelBackend {
     }
 
     fn clear(&self) -> Result<()> {
+        // テキスト表示に切り替えるので、再描画キャッシュも破棄する（消えた画像の復元を止める）。
+        *self.last.borrow_mut() = None;
         let mut out = std::io::stdout().lock();
         out.write_all(b"\x1b[2J\x1b[H")?;
         out.flush()?;
@@ -111,11 +142,42 @@ impl OutputBackend for SixelBackend {
         let sixel = sixel_encode(rgba, width as usize, height as usize, &opts)
             .map_err(|e| anyhow!("Sixel エンコード失敗: {e}"))?;
 
+        // passthrough 再描画用にキャッシュ（消されても再ラスタライズせず復元するため）。
+        *self.last.borrow_mut() = Some(sixel);
+        // 自ペインが非アクティブな間は描かない（別ペインを汚さない）。フォーカスが戻れば
+        // 定期再描画で復元される。
+        if !self.pane_is_active() {
+            return Ok(());
+        }
         let mut out = std::io::stdout().lock();
         // 画面クリア + 左上へ移動してから画像を描く。
         out.write_all(b"\x1b[2J\x1b[H")?;
-        self.write_sixel(&mut out, &sixel)?;
+        if let Some(sixel) = self.last.borrow().as_ref() {
+            self.write_sixel(&mut out, sixel)?;
+        }
         out.flush()?;
         Ok(())
+    }
+
+    fn redraw(&self) -> Result<()> {
+        // 自ペインが非アクティブなら描かない（別ペインに描いてしまうのを防ぐ）。
+        if !self.pane_is_active() {
+            return Ok(());
+        }
+        // tmux に消された可能性のある直近フレームを、その場（ペイン原点）へ再送する。
+        // 画面クリア（2J）はせず、同じ画素を上書きするだけなのでチラつきを抑えられる。
+        if let Some(sixel) = self.last.borrow().as_ref() {
+            let mut out = std::io::stdout().lock();
+            out.write_all(b"\x1b[H")?;
+            self.write_sixel(&mut out, sixel)?;
+            out.flush()?;
+        }
+        Ok(())
+    }
+
+    fn wants_periodic_redraw(&self) -> bool {
+        // passthrough のみ：tmux が追跡せず勝手に消すため定期復元が要る。
+        // ネイティブ／非 tmux は tmux/端末が画像を保持するので不要。
+        self.passthrough
     }
 }
