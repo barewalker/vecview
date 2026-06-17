@@ -42,8 +42,10 @@ enum Msg {
 enum Source {
     /// 単一 SVG ファイル。
     Svg(PathBuf),
-    /// Typst（`typst watch` が `vecview-<stem>-<p>.svg` をページごとに出力）。
-    Typst { dir: PathBuf, stem: String },
+    /// Typst（`typst watch` が `vecview-<stem>-<tag>-<p>.svg` をページごとに出力）。
+    /// `tag` はプロセス固有（PID）。同じ文書を複数インスタンスで開いても出力パスが衝突せず、
+    /// 互いのファイルを取り合ったり消し合ったりしないようにする。
+    Typst { dir: PathBuf, stem: String, tag: u32 },
     /// PDF（pdfium で直接ラスタライズ。ファイルは持たず、ドキュメントは main 側で保持）。
     /// 元 PDF を監視し、保存のたび開き直す。
     Pdf { pdf: PathBuf },
@@ -54,7 +56,9 @@ impl Source {
     fn page_path(&self, idx: usize) -> PathBuf {
         match self {
             Source::Svg(p) => p.clone(),
-            Source::Typst { dir, stem } => dir.join(format!("vecview-{stem}-{}.svg", idx + 1)),
+            Source::Typst { dir, stem, tag } => {
+                dir.join(format!("vecview-{stem}-{tag}-{}.svg", idx + 1))
+            }
             Source::Pdf { pdf } => pdf.clone(),
         }
     }
@@ -63,13 +67,7 @@ impl Source {
     fn page_count(&self) -> usize {
         match self {
             Source::Svg(_) | Source::Pdf { .. } => 1,
-            Source::Typst { dir, stem } => {
-                let mut n = 0;
-                while dir.join(format!("vecview-{stem}-{}.svg", n + 1)).exists() {
-                    n += 1;
-                }
-                n.max(1)
-            }
+            Source::Typst { dir, stem, tag } => typst_page_count(dir, stem, *tag),
         }
     }
 
@@ -84,20 +82,86 @@ impl Source {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
+    /// 終了時に自インスタンスが生成した一時ファイルを掃除する（Typst のみ）。PID 付きパスなので
+    /// 他インスタンス（同じ文書を開いている別プロセス含む）のファイルは消さない。
+    fn cleanup(&self) {
+        if let Source::Typst { dir, stem, tag } = self {
+            let prefix = format!("vecview-{stem}-{tag}-");
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for entry in rd.flatten() {
+                    if let Some(n) = entry.file_name().to_str() {
+                        if n.starts_with(&prefix) {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// 変更パスがこのソースの監視対象（ページファイル、または元 PDF）か。
     fn owns(&self, path: &Path) -> bool {
         match self {
             Source::Svg(p) => path == p,
             Source::Pdf { pdf } => path == pdf,
-            Source::Typst { dir, stem } => {
+            Source::Typst { dir, stem, tag } => {
                 path.parent() == Some(dir.as_path())
                     && path
                         .file_name()
                         .and_then(|s| s.to_str())
-                        .map(|n| n.starts_with(&format!("vecview-{stem}-")) && n.ends_with(".svg"))
+                        .map(|n| {
+                            n.starts_with(&format!("vecview-{stem}-{tag}-")) && n.ends_with(".svg")
+                        })
                         .unwrap_or(false)
             }
         }
+    }
+}
+
+/// Typst の現在ページ数＝連番ページ SVG の存在数。mtime での判定はしない（コンパイル中の
+/// ページ書き込みの一瞬を踏むと現行ページを古いと誤判定してページ数が落ち、表示が消える競合が
+/// 起きるため）。版縮小で取り残された古いページの除去は、コンパイル完了後に
+/// [`prune_stale_typst_pages`] が安全に削除する。
+fn typst_page_count(dir: &Path, stem: &str, tag: u32) -> usize {
+    let mut n = 0;
+    while dir
+        .join(format!("vecview-{stem}-{tag}-{}.svg", n + 1))
+        .exists()
+    {
+        n += 1;
+    }
+    n.max(1)
+}
+
+/// 版が縮んで取り残された自インスタンスの末尾ページ SVG を削除する。typst は1コンパイルで現行
+/// ページを十数 ms 内に全て書くため、現行ページは最新 mtime の密なクラスタになる。末尾から見て、
+/// 最新 mtime より明確に古い（`margin` 超）連続ぶんだけを取り残しとみなして消す。コンパイル完了後
+/// （debounce 済み Reload 時）に呼ぶ前提なので、書き込み途中の現行ページを誤って消さない。
+fn prune_stale_typst_pages(dir: &Path, stem: &str, tag: u32) {
+    let mut entries: Vec<(PathBuf, SystemTime)> = Vec::new();
+    let mut n = 0;
+    loop {
+        let p = dir.join(format!("vecview-{stem}-{tag}-{}.svg", n + 1));
+        match std::fs::metadata(&p).and_then(|m| m.modified()) {
+            Ok(t) => {
+                entries.push((p, t));
+                n += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    let Some(latest) = entries.iter().map(|(_, t)| *t).max() else {
+        return;
+    };
+    let margin = Duration::from_secs(1);
+    // 末尾（高ページ番号）から、latest より margin 超古いファイルだけ削除し、新しいクラスタに
+    // 達したら止める（先頭側の現行ページには触れない）。取り残しは常に末尾の連続ぶん。
+    for (path, t) in entries.iter().rev() {
+        let stale = latest.duration_since(*t).map(|d| d > margin).unwrap_or(false);
+        if !stale {
+            break;
+        }
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -500,6 +564,17 @@ fn main() -> Result<()> {
                     Err(e) => eprintln!("vecview: PDF 再オープンエラー: {e:#}"),
                 }
             } else {
+                // コンパイル完了後（debounce 済み）なので、版縮小で取り残された古い末尾ページを
+                // ここで安全に削除する（書き込み途中ではないため現行ページは消さない）。
+                if let Source::Typst { dir, stem, tag } = &source {
+                    prune_stale_typst_pages(dir, stem, *tag);
+                }
+                // 版が縮んでページ番号が現行ページ数を超えていたらクランプ（PDF 側と同様）。
+                let pc = current_page_count(&source, pdf_doc.as_ref());
+                if state.page >= pc {
+                    state.page = pc - 1;
+                    state.center = None;
+                }
                 // SVG/Typst は描画が atime を変えて notify が再発火する（自己トリガー）。
                 // 同一ページで mtime 不変なら描画しない。
                 let path = source.page_path(state.page);
@@ -616,6 +691,8 @@ fn main() -> Result<()> {
         let _ = child.kill();
         let _ = child.wait();
     }
+    // 自インスタンスが /tmp に出した一時ファイルを掃除（PID 付きなので他インスタンスは無傷）。
+    source.cleanup();
 
     Ok(())
 }
@@ -1094,10 +1171,10 @@ fn build_text_layer(
             let doc = pdf.ok_or_else(|| anyhow!("PDF が開かれていません"))?;
             doc.page_text(page)
         }
-        Source::Typst { dir, stem } => {
+        Source::Typst { dir, stem, tag } => {
             // Typst SVG はグリフをパス化していて文字を持たないため、同じ .typ を PDF にも
-            // コンパイルし、その文字＋座標を使う（pt 寸法は SVG と一致）。
-            let pdf_path = dir.join(format!("vecview-{stem}-text.pdf"));
+            // コンパイルし、その文字＋座標を使う（pt 寸法は SVG と一致）。PID 付きで他インスタンスと衝突回避。
+            let pdf_path = dir.join(format!("vecview-{stem}-{tag}-text.pdf"));
             let ok = Command::new("typst")
                 .arg("compile")
                 .arg(typ_path)
@@ -1351,6 +1428,47 @@ fn render_pdf(
     Ok(())
 }
 
+/// `dir` 内の `vecview-<stem>-<pid>-…` のうち、`<pid>` のプロセスがもう生きていないもの（＝過去に
+/// クラッシュ等で掃除されずに残ったファイル）を削除する。稼働中の他インスタンスのファイルは
+/// PID が生きているので消さない。プロセス生存判定は Linux の /proc を使い、それ以外の OS では何もしない
+/// （`/tmp` の再起動クリアに任せる）。
+fn sweep_dead_typst_pages(dir: &Path, stem: &str) {
+    let prefix = format!("vecview-{stem}-");
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        // "vecview-<stem>-" を剥がし、続く数字列（PID）を取り出す。
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let pid_str: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if !process_alive(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// PID のプロセスが生存しているか。Linux は `/proc/<pid>` の有無で判定。他 OS は常に true を返し
+/// （安全側＝消さない）、掃除を行わない。
+fn process_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// `typst watch <file> <tmp>-{p}.svg` を起動し、(Source, 子プロセス) を返す。
 fn spawn_typst_watch(typ: &Path) -> Result<(Source, Child)> {
     if which_typst().is_none() {
@@ -1362,8 +1480,13 @@ fn spawn_typst_watch(typ: &Path) -> Result<(Source, Child)> {
         .unwrap_or("vecview")
         .to_string();
     let dir = std::env::temp_dir();
+    // 出力パスはプロセス固有（PID）。同じ文書を複数インスタンスで開いてもファイルが衝突しない。
+    let tag = std::process::id();
+    // 過去にクラッシュ等で残った（プロセスが死んでいる）同名文書の取り残しだけ掃除する。
+    // 稼働中の他インスタンスのファイルは PID が生きているので消さない。監視開始前なので通知は出ない。
+    sweep_dead_typst_pages(&dir, &stem);
     // 複数ページ文書でも typst がエラーにならないようページ番号テンプレート {p} を使う。
-    let template = dir.join(format!("vecview-{stem}-{{p}}.svg"));
+    let template = dir.join(format!("vecview-{stem}-{tag}-{{p}}.svg"));
 
     let child = Command::new("typst")
         .arg("watch")
@@ -1376,7 +1499,7 @@ fn spawn_typst_watch(typ: &Path) -> Result<(Source, Child)> {
         .spawn()
         .context("typst watch の起動に失敗")?;
 
-    Ok((Source::Typst { dir, stem }, child))
+    Ok((Source::Typst { dir, stem, tag }, child))
 }
 
 fn mtime_of(path: &Path) -> Option<SystemTime> {
