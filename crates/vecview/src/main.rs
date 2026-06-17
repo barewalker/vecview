@@ -1886,7 +1886,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_cell_px_accepts_xX_and_clamps() {
+    fn parse_cell_px_accepts_x_separator_and_clamps() {
         assert_eq!(parse_cell_px("10x17"), Some((10, 17)));
         assert_eq!(parse_cell_px(" 12 X 24 "), Some((12, 24)));
         assert_eq!(parse_cell_px("0x999"), Some((1, 128))); // 1..=128 にクランプ

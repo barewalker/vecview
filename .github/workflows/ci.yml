@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 全ターゲット（テストコード含む）をコンパイルして壊れていないか確認。
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # GPU(Vulkan) / libpdfium を要するテスト（vecview-renderer の描画テスト・tests/ の統合
+      # テスト）は CI のクリーン環境では動かないため、ロジックのユニットテストのみ実行する。
+      - name: Unit tests
+        run: cargo test -p vecview --bins --locked
