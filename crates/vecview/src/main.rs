@@ -1113,7 +1113,31 @@ fn build_text_layer(
                 bail!("typst compile（テキスト用 PDF）が失敗しました");
             }
             let doc = vecview_pdf::Pdf::open(&pdf_path).context("テキスト用 PDF を開けません")?;
-            doc.page_text(page)
+            let mut glyphs = doc.page_text(page)?;
+            // 表示は SVG（usvg）で、usvg は SVG の pt 指定を 96dpi で px に正規化するため、表示・
+            // ビューポートは「pt × 96/72」の単位になる。一方グリフ矩形は PDF の pt のまま。両者の
+            // ページ寸法比で同じ単位へスケールしないと、選択ハイライトが下/右へ行くほどズレる。
+            // 比はレンダラが実際に使う SVG 寸法と PDF pt 寸法から直接取る（usvg の DPI に非依存）。
+            if let Ok((pdf_w, pdf_h)) = doc.page_size(page) {
+                let svg_dims = source
+                    .page_path(page)
+                    .to_str()
+                    .and_then(|p| SvgDocument::open(p).ok())
+                    .and_then(|d| d.render_page(0).ok())
+                    .map(|pg| (pg.width, pg.height));
+                if let Some((sw, sh)) = svg_dims {
+                    if pdf_w > 0.0 && pdf_h > 0.0 {
+                        let (rx, ry) = (sw / pdf_w, sh / pdf_h);
+                        for g in &mut glyphs {
+                            g.rect[0] *= rx;
+                            g.rect[1] *= ry;
+                            g.rect[2] *= rx;
+                            g.rect[3] *= ry;
+                        }
+                    }
+                }
+            }
+            Ok(glyphs)
         }
         // 単体 SVG（Typst 由来含む）は <text> を持たないことが多く、テキスト層は作れない。
         Source::Svg(_) => Ok(Vec::new()),
