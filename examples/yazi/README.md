@@ -27,13 +27,23 @@ cp -r examples/yazi/vv.yazi ~/.config/yazi/plugins/
 ```toml
 [plugin]
 prepend_previewers = [
-    { url = "*.typ", run = "vv" },   # Typst（yazi 非対応 → これが本命）
-    { url = "*.svg", run = "vv" },   # SVG（ベクター品質。任意。yazi 既定でも一応見られる）
-    { mime = "application/pdf", run = "vv" },  # PDF（任意。yazi 既定の方が速い場合あり）
+    { url = "*.typ", run = "vv" },              # Typst（yazi 非対応 → これが本命）
+    { mime = "image/svg+xml", run = "vv" },     # SVG（mime 指定。url=*.svg だと既定の画像処理に取られる）
+    { mime = "application/pdf", run = "vv" },   # PDF（任意。yazi 既定の方が速い場合あり）
 ]
 ```
 
-`.typ` だけで十分なら svg/pdf の行は外してよい。
+`.typ` だけで十分なら svg/pdf の行は外してよい。SVG / PDF は mime で指定する（`url=` グロブだと
+yazi 既定の画像/PDF 処理に先取りされ、こちらの previewer に来ないことがある）。
+
+## tmux での注意（重要）
+
+tmux 越しの kitty 画像転送は重く、**ウィンドウ最大化 ＋ 高頻度のファイル切り替え**で端末
+（Ghostty 等）が落ちることがある（tmux 非経由のネイティブでは起きない）。緩和策:
+
+- `[preview] image_delay`（ミリ秒）を上げて切り替え中の転送頻度を抑える（例 `120`）
+- 巨大なプレビューを避ける（`[preview] max_width` / `max_height` を控えめに）
+- 重く使うときは tmux の外（ネイティブ端末）で yazi を使う
 
 ## メモ
 
