@@ -534,6 +534,24 @@ fn main() -> Result<()> {
                                 overlay_only = true; // view 不変＝軽量再描画。
                             }
                         }
+                        // ホイール: ページめくり（下=次ページ、上=前ページ）。実際にページが
+                        // 変わったときだけ再描画する。copy mode 中はグリフ座標が陳腐化するので抜ける。
+                        MouseEventKind::ScrollDown => {
+                            let prev = state.page;
+                            apply_action(Action::NextPage, pages, &mut state);
+                            if state.page != prev {
+                                state.copy = None;
+                                dirty = true;
+                            }
+                        }
+                        MouseEventKind::ScrollUp => {
+                            let prev = state.page;
+                            apply_action(Action::PrevPage, pages, &mut state);
+                            if state.page != prev {
+                                state.copy = None;
+                                dirty = true;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1064,11 +1082,14 @@ fn help_lines(keymap: &Keymap) -> Vec<String> {
         lines.push(format!("  {name:<12} {}", keys.join(", ")));
     }
     lines.push(String::new());
+    lines.push("  mouse:".to_string());
+    lines.push("    wheel          next / prev page".to_string());
+    lines.push("    drag           select text & copy on release".to_string());
+    lines.push(String::new());
     lines.push("  copy mode (text selection):".to_string());
     lines.push("    hjkl / arrows  move caret    0 / $   line start / end".to_string());
     lines.push("    g / G          doc start/end space   start/clear selection".to_string());
     lines.push("    enter or y     copy & exit   esc / q cancel".to_string());
-    lines.push("    mouse drag     select & copy on release".to_string());
     lines.push(String::new());
     let path = config_path()
         .map(|p| p.display().to_string())
