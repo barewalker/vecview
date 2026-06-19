@@ -192,6 +192,23 @@ struct Args {
     /// それも無ければ 1（等倍）。端末が耐えるなら 2 以上でシャープに。
     #[arg(short, long)]
     scale: Option<u32>,
+
+    /// ヘッドレス描画モード。対話せず1ページを PNG に描いて終了する（yazi / nvim 連携の土台）。
+    /// `--size` 必須。出力は `--output`（既定は stdout）。
+    #[arg(long)]
+    render: bool,
+
+    /// ヘッドレス描画の出力ピクセルサイズ `幅x高`（例 `800x1000`）。`--render` 時に必須。
+    #[arg(long)]
+    size: Option<String>,
+
+    /// ヘッドレス描画の出力先。PNG パス、または `-` で stdout。`--render` 時のみ有効（既定 `-`）。
+    #[arg(short, long)]
+    output: Option<String>,
+
+    /// 描画するページ（1始まり）。`--render` 時のみ有効（既定 1）。
+    #[arg(long, default_value_t = 1)]
+    page: usize,
 }
 
 fn main() -> Result<()> {
@@ -210,6 +227,12 @@ fn main() -> Result<()> {
 
     if !args.file.exists() {
         bail!("ファイルが見つかりません: {}", args.file.display());
+    }
+
+    // ヘッドレス描画モード（--render）：端末も対話もなしで1ページを PNG に描いて即終了する。
+    // yazi の previewer や nvim プラグインが「指定サイズの画像を1枚作る」ために使う土台。
+    if args.render {
+        return render_headless(&args);
     }
 
     let ext = args
@@ -1479,6 +1502,146 @@ fn fill_letterbox(rgba: &mut [u8], out_w: u32, out_h: u32, viewport: [f32; 4], p
             rgba[idx + 3] = 255;
         }
     }
+}
+
+/// ヘッドレス描画（`--render`）：端末も対話もなしで1ページを RGBA へ描き、PNG として出力する。
+/// 描画経路は対話モードと同じ（PDF=pdfium、SVG/Typst=wgpu）で、出力は `--size` の実ピクセル。
+fn render_headless(args: &Args) -> Result<()> {
+    let (out_w, out_h) = match args.size.as_deref() {
+        Some(s) => parse_size(s)
+            .ok_or_else(|| anyhow!("--size の形式が不正です（例: 800x1000）: {s}"))?,
+        None => bail!("--render には --size が必要です（例: --size 800x1000）"),
+    };
+    let output = args.output.as_deref().unwrap_or("-");
+    let zoom = args.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+    let page_idx = args.page.saturating_sub(1);
+
+    let ext = args
+        .file
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let rgba = match ext.as_str() {
+        "pdf" => render_pdf_headless(&args.file, page_idx, out_w, out_h, zoom)?,
+        "svg" => {
+            let renderer = Renderer::new().context("レンダラー初期化")?;
+            render_svg_file(&args.file, &renderer, out_w, out_h, zoom)?
+        }
+        "typ" => render_typ_headless(&args.file, page_idx, out_w, out_h, zoom)?,
+        other => bail!("未対応の拡張子です: .{other}（svg / typ / pdf のみ対応）"),
+    };
+    write_png(&rgba, out_w, out_h, output)
+}
+
+/// ヘッドレスで PDF の1ページをビューポート（ページ中央・指定ズーム）でラスタライズする。
+fn render_pdf_headless(file: &Path, page: usize, out_w: u32, out_h: u32, zoom: u32) -> Result<Vec<u8>> {
+    let pdf = vecview_pdf::Pdf::open(file).context("PDF を開けません")?;
+    let pages = pdf.page_count();
+    if page >= pages {
+        bail!("ページ範囲外: {}（総 {} ページ）", page + 1, pages);
+    }
+    let (pw, ph) = pdf.page_size(page)?;
+    let (pw, ph) = (pw.max(1.0), ph.max(1.0));
+    let viewport = viewport_for(pw, ph, out_w, out_h, zoom, (pw / 2.0, ph / 2.0));
+    let mut rgba = pdf.render(page, viewport, out_w, out_h)?;
+    fill_letterbox(&mut rgba, out_w, out_h, viewport, pw, ph);
+    Ok(rgba)
+}
+
+/// ヘッドレスで Typst を単発コンパイル（`typst compile`）して SVG を生成し、要求ページを描く。
+/// 出力は一時ディレクトリに `vv-render-<stem>-<pid>-{p}.svg` として作り、描画後に掃除する。
+fn render_typ_headless(file: &Path, page: usize, out_w: u32, out_h: u32, zoom: u32) -> Result<Vec<u8>> {
+    if which_typst().is_none() {
+        bail!("typst が PATH にありません。Typst の描画には typst が必要です。");
+    }
+    let dir = std::env::temp_dir();
+    let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("vv");
+    let tag = std::process::id();
+    let template = dir.join(format!("vv-render-{stem}-{tag}-{{p}}.svg"));
+    let ok = Command::new("typst")
+        .arg("compile")
+        .arg(file)
+        .arg(&template)
+        .arg("--format")
+        .arg("svg")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit()) // コンパイルエラーは表示する。
+        .status()
+        .context("typst compile の起動に失敗")?
+        .success();
+    // 自分が出した一時 SVG（全ページ分）を消す。
+    let cleanup = || {
+        let prefix = format!("vv-render-{stem}-{tag}-");
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                if e.file_name().to_str().is_some_and(|n| n.starts_with(&prefix)) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    };
+    if !ok {
+        cleanup();
+        bail!("typst compile が失敗しました");
+    }
+    let page_svg = dir.join(format!("vv-render-{stem}-{tag}-{}.svg", page + 1));
+    if !page_svg.exists() {
+        cleanup();
+        bail!("ページ範囲外、または SVG が生成されませんでした: ページ {}", page + 1);
+    }
+    let renderer = Renderer::new().context("レンダラー初期化")?;
+    let res = render_svg_file(&page_svg, &renderer, out_w, out_h, zoom);
+    cleanup();
+    res
+}
+
+/// SVG ファイルを開き、ページ中央・指定ズームのビューポートで RGBA へ描く（ヘッドレス共通）。
+fn render_svg_file(path: &Path, renderer: &Renderer, out_w: u32, out_h: u32, zoom: u32) -> Result<Vec<u8>> {
+    let doc = SvgDocument::open(
+        path.to_str()
+            .ok_or_else(|| anyhow!("パスが UTF-8 でありません"))?,
+    )?;
+    let page = doc.render_page(0)?;
+    let pw = page.width.max(1.0);
+    let ph = page.height.max(1.0);
+    let viewport = viewport_for(pw, ph, out_w, out_h, zoom, (pw / 2.0, ph / 2.0));
+    renderer.render(&page, out_w, out_h, viewport)
+}
+
+/// RGBA8（out_w×out_h）を PNG として `output` へ書く。`output` が `-` なら stdout。
+fn write_png(rgba: &[u8], w: u32, h: u32, output: &str) -> Result<()> {
+    use image::codecs::png::PngEncoder;
+    use image::{ExtendedColorType, ImageEncoder};
+    use std::io::Write;
+    let encode = |writer: &mut dyn std::io::Write| -> Result<()> {
+        PngEncoder::new(writer)
+            .write_image(rgba, w, h, ExtendedColorType::Rgba8)
+            .map_err(|e| anyhow!("PNG エンコード失敗: {e}"))
+    };
+    if output == "-" {
+        let mut out = std::io::stdout().lock();
+        encode(&mut out)?;
+        out.flush()?;
+    } else {
+        let f = std::fs::File::create(output)
+            .with_context(|| format!("出力ファイルを作成できません: {output}"))?;
+        let mut w = std::io::BufWriter::new(f);
+        encode(&mut w)?;
+        w.flush()?;
+    }
+    Ok(())
+}
+
+/// `"幅x高"`（区切りは `x`/`X`）を (幅, 高) ピクセルへ解析する。0 は不可、上限 16384 にクランプ。
+fn parse_size(s: &str) -> Option<(u32, u32)> {
+    let (w, h) = s.trim().split_once(['x', 'X'])?;
+    let w: u32 = w.trim().parse().ok()?;
+    let h: u32 = h.trim().parse().ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w.min(16384), h.min(16384)))
 }
 
 /// `dir` 内の `vecview-<stem>-<pid>-…` のうち、`<pid>` のプロセスがもう生きていないもの（＝過去に
