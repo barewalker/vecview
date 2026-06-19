@@ -106,10 +106,18 @@ vv --render paper.pdf --size 700x900 --page 3 -o -    # 3ページ目を stdout 
 まま、copy mode 突入時に同じ `.typ` を裏で PDF にもコンパイルし、その文字・座標を選択に使う
 （Typst の SVG はグリフがパス化され文字を持たないため）。単体 `.svg` はテキスト層を持たない。
 
-### nvim との組み合わせ
+### エディタ・ファイラ連携（yazi / nvim）
 
-tmux の別ペインで `vv doc.typ` を起動しておけば、nvim で `doc.typ` を編集・保存するたびに
-プレビューが更新される。プラグインは不要。
+`vv --render`（ヘッドレス PNG 出力）を土台にした連携プラグインを同梱している。
+
+- **[examples/nvim](examples/nvim/)** — `vv.nvim`。Neovim 内に SVG / Typst / PDF のライブ
+  プレビューを出す（純 Lua・第三者依存なし、Kitty graphics）。`.typ` を `:VV` で別窓に表示し、
+  保存のたびに再描画。**論文・資料作成が nvim 内で完結**する。
+- **[examples/yazi](examples/yazi/)** — `vv.yazi`。yazi のプレビューペインに SVG / Typst / PDF を
+  表示する previewer。とくに **Typst は yazi 単体では見られない**ため有用。
+
+いずれもプラグインを使わず、tmux の別ペインで `vv doc.typ` を起動して横に並べる使い方でもよい
+（nvim で `doc.typ` を保存するたびにプレビューが更新される。プラグイン不要）。
 
 ## 出力バックエンド
 
