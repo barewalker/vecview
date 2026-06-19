@@ -1417,6 +1417,10 @@ fn render_pdf(
     state.last_viewport = Some(viewport);
 
     let mut rgba = pdf.render(state.page, viewport, out_w, out_h)?;
+    // pdfium はビットマップ全体（ページ範囲外の letterbox 含む）を白の clear_color で塗るため、
+    // 縦長ページを横長ペインへフィットすると左右が白帯になり、ページの白と見分けがつかず「余分な
+    // 左右余白」に見える。SVG/Typst レンダラと同じ暗色でページ外を塗り直し、ページ境界を可視にする。
+    fill_letterbox(&mut rgba, out_w, out_h, viewport, pw, ph);
     // copy mode 中はオーバーレイ適用前のベースをキャッシュ（以降のキャレット移動で使い回す）。
     if state.copy.is_some() {
         *base = Some(BaseFrame { out_w, out_h, viewport, rgba: rgba.clone() });
@@ -1426,6 +1430,34 @@ fn render_pdf(
     }
     backend.display(&rgba, out_w, out_h)?;
     Ok(())
+}
+
+/// ページ範囲外（letterbox）を暗色で塗る。pdfium はページ範囲外も clear_color の白で塗ってしまう
+/// ため、SVG レンダラ（`LETTERBOX` = 0.10 グレー相当）に合わせてページ境界を見えるようにする。
+/// ページ矩形 [0,0,pw,ph]（pt）をビューポート→出力ピクセルへ順変換し、その外側だけ塗り替える。
+/// 拡大中（ページが出力を覆う）は矩形が出力全体を含むので何もしない。
+fn fill_letterbox(rgba: &mut [u8], out_w: u32, out_h: u32, viewport: [f32; 4], pw: f32, ph: f32) {
+    let [vx, vy, vw, vh] = viewport;
+    let sx = out_w as f32 / vw.max(1.0);
+    let sy = out_h as f32 / vh.max(1.0);
+    let x0 = ((0.0 - vx) * sx).round();
+    let y0 = ((0.0 - vy) * sy).round();
+    let x1 = ((pw - vx) * sx).round();
+    let y1 = ((ph - vy) * sy).round();
+    const C: u8 = 26; // LETTERBOX(0.10) を 8bit へ（0.10*255≒26）。
+    for y in 0..out_h {
+        let inside_y = (y as f32) >= y0 && (y as f32) < y1;
+        for x in 0..out_w {
+            if inside_y && (x as f32) >= x0 && (x as f32) < x1 {
+                continue; // ページ内はそのまま。
+            }
+            let idx = ((y * out_w + x) * 4) as usize;
+            rgba[idx] = C;
+            rgba[idx + 1] = C;
+            rgba[idx + 2] = C;
+            rgba[idx + 3] = 255;
+        }
+    }
 }
 
 /// `dir` 内の `vecview-<stem>-<pid>-…` のうち、`<pid>` のプロセスがもう生きていないもの（＝過去に

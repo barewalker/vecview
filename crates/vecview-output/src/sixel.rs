@@ -150,8 +150,11 @@ impl OutputBackend for SixelBackend {
             return Ok(());
         }
         let mut out = std::io::stdout().lock();
-        // 画面クリア + 左上へ移動してから画像を描く。
-        out.write_all(b"\x1b[2J\x1b[H")?;
+        // 左上へ移動して同じ領域へ上書きする。2J で全消去すると、消去〜次の sixel が出るまでの
+        // 間に空白フレームが入って点滅する（SSH+tmux 越しは転送が遅く特に顕著。typst ビルド中は
+        // 保存のたびに再描画が走るので激しくちらつく）。画像は常にペイン全体・同寸法なので前フレーム
+        // は新フレームで完全に覆われ、クリアは要らない。redraw() と同じ最小更新。
+        out.write_all(b"\x1b[H")?;
         if let Some(sixel) = self.last.borrow().as_ref() {
             self.write_sixel(&mut out, sixel)?;
         }
