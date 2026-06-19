@@ -19,27 +19,34 @@ protocol** で重ねる。`.typ` は保存のたびに再描画＝**論文・資
 
 ## インストール（lazy.nvim）
 
+プラグイン本体はこのリポジトリの **サブディレクトリ** `examples/nvim/vv.nvim/` にある。lazy.nvim には
+サブディレクトリを指定する `rtp=` キーが無いので、`config` で runtimepath に足してから `require` する:
+
 ```lua
 {
   "barewalker/vecview",
-  -- リポジトリ内のサブディレクトリをプラグイン本体にする
-  rtp = "examples/nvim/vv.nvim",
   cmd = { "VV", "VVToggle", "VVClose", "VVNext", "VVPrev", "VVRefresh" },
-  opts = {
-    -- 端末セルのピクセル寸法（描画解像度の目安。シャープさだけに効く）。
-    cell_width = 10,
-    cell_height = 20,
-    width = 0.5,        -- フロート幅（エディタ全幅に対する割合）
-    -- vv = "vv",       -- 実行ファイル名を変えている場合
-  },
-  config = function(_, o) require("vv").setup(o) end,
   keys = {
     { "<leader>vv", "<cmd>VVToggle<cr>", desc = "vecview preview" },
     { "<leader>vn", "<cmd>VVNext<cr>",   desc = "vecview next page" },
     { "<leader>vp", "<cmd>VVPrev<cr>",   desc = "vecview prev page" },
   },
+  opts = {
+    cell_width = 10,   -- 端末セルのピクセル寸法（描画解像度の目安。シャープさだけに効く）
+    cell_height = 20,
+    width = 0.5,       -- フロート幅（エディタ全幅に対する割合）
+    -- vv = "vv",      -- 実行ファイル名を変えている場合
+  },
+  config = function(plugin, opts)
+    -- サブディレクトリを runtimepath に追加してから setup（lazy には rtp= が無いため）。
+    vim.opt.rtp:append(plugin.dir .. "/examples/nvim/vv.nvim")
+    require("vv").setup(opts)
+  end,
 }
 ```
+
+> 公開前のローカルテストでは、上記の代わりに `dir = "/path/to/vecview/examples/nvim/vv.nvim"` を
+> 指定する（`dir` はそのディレクトリ自体を runtimepath に入れるので rtp 追加は不要）。
 
 手動で置く場合は `examples/nvim/vv.nvim` を runtimepath に足し、`require("vv").setup({...})` を呼ぶ。
 
