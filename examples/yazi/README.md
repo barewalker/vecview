@@ -28,13 +28,21 @@ cp -r examples/yazi/vv.yazi ~/.config/yazi/plugins/
 [plugin]
 prepend_previewers = [
     { url = "*.typ", run = "vv" },              # Typst（yazi 非対応 → これが本命）
-    { mime = "image/svg+xml", run = "vv" },     # SVG（mime 指定。url=*.svg だと既定の画像処理に取られる）
+    { url = "*.svg", run = "vv" },              # SVG（任意）
     { mime = "application/pdf", run = "vv" },   # PDF（任意。yazi 既定の方が速い場合あり）
+]
+# SVG は画像 mime のため、yazi 標準の画像プリローダが外部 `resvg` で svg→PNG 変換しようとする
+# （resvg 未導入だと "Failed to start resvg" エラー）。プリローダを noop にして vv 経路へ一本化する。
+prepend_preloaders = [
+    { url = "*.svg", run = "noop" },
 ]
 ```
 
-`.typ` だけで十分なら svg/pdf の行は外してよい。SVG / PDF は mime で指定する（`url=` グロブだと
-yazi 既定の画像/PDF 処理に先取りされ、こちらの previewer に来ないことがある）。
+`.typ` だけで十分なら svg/pdf の行は外してよい。
+
+> SVG を vv で扱わず **yazi 標準の svg プレビュー**で済ませたい場合は、上の svg 行と preloaders を
+> 消して、代わりに `resvg` を入れる（`cargo install resvg`）。resvg は usvg ベースで vv と同じ描画
+> エンジンなので画質は同等。
 
 ## tmux での注意（重要）
 
