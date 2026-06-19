@@ -174,7 +174,7 @@ fn current_page_count(source: &Source, pdf: Option<&vecview_pdf::Pdf>) -> usize 
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "vecview", version, about = "ベクターグラフィクスをターミナルに表示する")]
+#[command(name = "vv", version, about = "vecview - ベクターグラフィクスをターミナルに表示する")]
 struct Args {
     /// 表示するファイル（SVG / Typst .typ / PDF）。
     file: PathBuf,

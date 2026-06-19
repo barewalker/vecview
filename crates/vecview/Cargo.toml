@@ -3,8 +3,9 @@ name = "vecview"
 version.workspace = true
 edition.workspace = true
 
+# パッケージ（正式名称）は vecview のまま、インストールされるコマンド名は短い vv にする。
 [[bin]]
-name = "vecview"
+name = "vv"
 path = "src/main.rs"
 
 [dependencies]
