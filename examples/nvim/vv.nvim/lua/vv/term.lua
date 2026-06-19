@@ -44,6 +44,24 @@ local function wrap(seq)
 	return ESC .. "Ptmux;" .. seq:gsub(ESC, ESC .. ESC) .. ESC .. "\\"
 end
 
+-- tmux 内では passthrough のカーソル位置指定がパネル変換を介さず物理スクリーン座標になるため、
+-- nvim 相対座標に自パネルの左上オフセット（pane_left/pane_top）を足して物理座標へ変換する
+-- （image.nvim と同じ）。$TMUX_PANE で自パネルを対象に取得する。
+local function pane_offset()
+	if not in_tmux then
+		return 0, 0
+	end
+	local pane = vim.env.TMUX_PANE
+	local args = { "tmux", "display-message", "-p" }
+	if pane and pane ~= "" then
+		vim.list_extend(args, { "-t", pane })
+	end
+	vim.list_extend(args, { "-F", "#{pane_left} #{pane_top}" })
+	local out = vim.fn.system(args)
+	local l, t = out:match("(%d+)%s+(%d+)")
+	return tonumber(l) or 0, tonumber(t) or 0
+end
+
 --- PNG ファイルを画像 ID `id` として、スクリーンセル (row,col)（1始まり）へ cols×rows セルに
 --- 収めて表示する。直接データ転送（t=d, f=100=PNG）。寸法は PNG ヘッダから端末が読む。
 function M.show(png_path, id, row, col, cols, rows)
@@ -57,6 +75,11 @@ function M.show(png_path, id, row, col, cols, rows)
 		return false
 	end
 	local payload = vim.base64.encode(data)
+
+	-- tmux パネルのオフセットを足して物理スクリーン座標へ（passthrough は物理座標になるため）。
+	local off_l, off_t = pane_offset()
+	row = row + off_t
+	col = col + off_l
 
 	-- 同期出力開始 → カーソル保存 → フロート左上へ移動（この後の転送完了時にそこへ表示される）。
 	write(wrap(ESC .. "[?2026h" .. ESC .. "[s" .. ESC .. "[" .. row .. ";" .. col .. "H"))
