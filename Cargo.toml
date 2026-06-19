@@ -23,7 +23,7 @@ thiserror = "2"
 
 # フォーマット
 usvg = "0.47"
-# pdfium-render はフェーズ6で追加
+# pdfium-render は PDF を使う vecview-pdf でのみ依存（クレート側で宣言）
 
 # レンダリング
 lyon = "1"

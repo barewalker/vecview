@@ -51,6 +51,7 @@ vecview doc.typ -b sixel          # バックエンド強制 [kitty|tmux|sixel|f
 | `j` / `Space` / `PageDown` | 次ページ |
 | `k` / `PageUp` / `Backspace` | 前ページ |
 | `h` / `l` | 先頭 / 最終ページ |
+| マウスホイール | ページ送り（下＝次 / 上＝前） |
 | `y` | テキスト選択（copy mode）へ入る |
 | `?` | ヘルプ表示 |
 | `q` / `Esc` / `Ctrl-C` | 終了 |
