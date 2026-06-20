@@ -12,15 +12,19 @@ the preview in your terminal updates.
 
 ## Installation
 
-Install with cargo straight from GitHub:
+Install from [crates.io](https://crates.io/crates/vecview) with cargo:
 
 ```bash
-cargo install --git https://github.com/barewalker/vecview
+cargo install vecview
 ```
 
-Or build from a local clone:
+Other options:
 
 ```bash
+# Latest from GitHub
+cargo install --git https://github.com/barewalker/vecview
+
+# From a local clone
 cargo install --path crates/vecview
 # or: cargo build --release  →  target/release/vv
 ```
