@@ -12,12 +12,25 @@ the preview in your terminal updates.
 
 ## Installation
 
+Install with cargo straight from GitHub:
+
+```bash
+cargo install --git https://github.com/barewalker/vecview
+```
+
+Or build from a local clone:
+
 ```bash
 cargo install --path crates/vecview
 # or: cargo build --release  →  target/release/vv
 ```
 
-The installed command is **`vv`** (the project's full name is vecview).
+Prebuilt binaries (built against an older glibc for broad portability) are attached
+to each [GitHub Release](https://github.com/barewalker/vecview/releases) — download
+`vv`, `chmod +x vv`, and put it on your `PATH` if you'd rather not build it yourself.
+
+The installed command is **`vv`** (the project's full name is vecview). Note that the
+runtime dependencies below still need to be present regardless of how you install.
 
 ### Runtime dependencies
 
