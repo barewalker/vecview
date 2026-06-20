@@ -12,7 +12,7 @@ local M = {}
 -- 大きめに描いて `ya.image_show` がペインへ縮小フィットする。
 local function render_size()
 	local w, h = 1000, 1400
-	local ok = pcall(function()
+	pcall(function()
 		if rt and rt.preview then
 			if type(rt.preview.max_width) == "number" and rt.preview.max_width > 0 then
 				w = rt.preview.max_width
@@ -22,7 +22,6 @@ local function render_size()
 			end
 		end
 	end)
-	local _ = ok
 	return string.format("%dx%d", w, h)
 end
 
@@ -35,7 +34,7 @@ function M:peek(job)
 	-- キャッシュが無ければ vv で1ページ（skip+1）を PNG 化する。`vv` は PATH のバイナリを
 	-- 直接起動するので、cellpx 補正用シェル関数は経由しない（--render は端末非依存で不要）。
 	if not fs.cha(cache) then
-		local output, err = Command("vv")
+		local output = Command("vv")
 			:arg({
 				"--render",
 				tostring(job.file.url),
@@ -50,14 +49,10 @@ function M:peek(job)
 			:stderr(Command.PIPED)
 			:output()
 
-		if not output then
-			return ya.preview_widgets(job, {
-				ui.Text(string.format("vv の起動に失敗しました: %s", err)):area(job.area),
-			})
-		elseif not output.status.success then
-			return ya.preview_widgets(job, {
-				ui.Text(string.format("vv --render 失敗:\n%s", output.stderr or "")):area(job.area),
-			})
+		-- vv 失敗時（vv 未導入・typst 不在・描画不能など）は静かに何も表示しない。
+		-- yazi 26 では ya.preview_widgets が無くエラー描画 API が異なるため、ここでは描かない。
+		if not output or not output.status.success then
+			return
 		end
 	end
 

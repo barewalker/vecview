@@ -44,14 +44,29 @@ prepend_preloaders = [
 > 消して、代わりに `resvg` を入れる（`cargo install resvg`）。resvg は usvg ベースで vv と同じ描画
 > エンジンなので画質は同等。
 
-## tmux での注意（重要）
+## tmux + Ghostty のクラッシュについて（重要）
 
-tmux 越しの kitty 画像転送は重く、**ウィンドウ最大化 ＋ 高頻度のファイル切り替え**で端末
-（Ghostty 等）が落ちることがある（tmux 非経由のネイティブでは起きない）。緩和策:
+**Ghostty を tmux 越しで使うと、画像プレビューで Ghostty 自体が落ちることがある。これは
+vecview ではなく Ghostty 側の既知バグ**で、yazi 標準の画像（png/jpg）でも、ネイティブの kitty 画像
+全般でも起きる（tmux 非経由のネイティブでは起きない）。報告された発生条件:
 
-- `[preview] image_delay`（ミリ秒）を上げて切り替え中の転送頻度を抑える（例 `120`）
-- 巨大なプレビューを避ける（`[preview] max_width` / `max_height` を控えめに）
+- tmux の **`mouse on`** で発生（**`mouse off` だと起きない**）
+- ウィンドウが **~90x40 セルより大きい**（最大化）と発生
+- 画像が **~100KB 超**で発生
+
+参考: ghostty-org/ghostty discussions [#11909](https://github.com/ghostty-org/ghostty/discussions/11909) /
+[#4266](https://github.com/ghostty-org/ghostty/discussions/4266) /
+[#9197](https://github.com/ghostty-org/ghostty/discussions/9197)
+
+回避策:
+
+- **tmux のマウスを切る**（`set -g mouse off`、または `prefix+m` でトグル運用）— 最も確実
+- ウィンドウを最大化しない（小さめなら `mouse on` でも出にくい）
+- Ghostty を更新する（活発に修正されている領域）
 - 重く使うときは tmux の外（ネイティブ端末）で yazi を使う
+
+なお `[preview] image_delay`（0〜100ms）や `max_width`/`max_height` を控えめにすると緩和には
+なるが、上記バグの根治にはならない。
 
 ## メモ
 
