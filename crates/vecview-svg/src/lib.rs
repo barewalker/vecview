@@ -1,12 +1,13 @@
-//! SVG パーサー。`usvg` で SVG をパースし、フォーマット非依存な [`Page`] に変換する。
+//! SVG parser. Parses SVG with `usvg` and converts it into a format-independent [`Page`].
 //!
-//! `usvg` の `Path::data()` は絶対座標（親 transform 適用済み）でセグメントを返すため、
-//! 変換側で transform 行列を合成する必要はない。ラスタライズ（resvg）は使わず、
-//! ベクター情報（ベジェ曲線）をそのまま [`PathData`] に写し取る。
+//! `usvg`'s `Path::data()` returns segments in absolute coordinates (with the parent
+//! transform already applied), so there is no need to compose a transform matrix on the
+//! conversion side. Rasterization (resvg) is not used; the vector information (Bezier
+//! curves) is copied directly into [`PathData`].
 //!
-//! Typst が出力する SVG は文字もパス化されているため、本パーサーは `Node::Path` のみを
-//! 扱えば本文・罫線を描画できる。グラデーションは先頭ストップ色で近似し、
-//! クリップ/マスク/画像/テキストノードは初回スコープでは無視する。
+//! Since the SVG that Typst emits also turns text into paths, this parser only needs to
+//! handle `Node::Path` to draw the body text and rules. Gradients are approximated by the
+//! first stop color, and clip/mask/image/text nodes are ignored in the initial scope.
 
 use anyhow::Result;
 use vecview_core::{
@@ -18,29 +19,31 @@ pub struct SvgDocument {
 }
 
 impl SvgDocument {
-    /// ファイルパスから読み込む。
+    /// Loads from a file path.
     pub fn open(path: &str) -> Result<Self> {
         let data = std::fs::read(path)?;
         Self::from_bytes(&data)
     }
 
-    /// バイト列からパースする。
+    /// Parses from a byte slice.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         let opt = usvg::Options::default();
-        // usvg は `<use transform="T">` の T を二重適用するバグがある（matplotlib のテキストや
-        // pdftocairo の凡例で多発）。意味的に等価な `<g transform="T"><use/></g>` へ書き換えると
-        // 正しく解決される。SVG はテキストなので、パース前に書き換える（ネスト SVG 画像内も）。
+        // usvg has a bug that double-applies the T of `<use transform="T">` (common with
+        // matplotlib text and pdftocairo legends). Rewriting it to the semantically
+        // equivalent `<g transform="T"><use/></g>` resolves it correctly. Since SVG is
+        // text, rewrite it before parsing (including inside nested SVG images).
         let tree = match std::str::from_utf8(data) {
             Ok(text) => usvg::Tree::from_data(rewrite_use_transforms(text).as_bytes(), &opt)?,
-            Err(_) => usvg::Tree::from_data(data, &opt)?, // 非UTF-8（gzip 等）はそのまま。
+            Err(_) => usvg::Tree::from_data(data, &opt)?, // Non-UTF-8 (gzip, etc.) is left as is.
         };
         Ok(Self { tree })
     }
 }
 
-/// `<use … transform="T" …/>` を `<g transform="T"><use …/></g>` に書き換える（usvg の
-/// `<use>` transform 二重適用バグの回避）。ネスト SVG 画像（data:image/svg+xml;base64,…）の
-/// 中身も再帰的に処理する。意味的に等価な変換なので副作用はない。
+/// Rewrites `<use … transform="T" …/>` to `<g transform="T"><use …/></g>` (working around
+/// usvg's `<use>` transform double-application bug). The contents of nested SVG images
+/// (data:image/svg+xml;base64,…) are processed recursively as well. The transform is
+/// semantically equivalent, so there are no side effects.
 fn rewrite_use_transforms(svg: &str) -> std::borrow::Cow<'_, str> {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
@@ -54,7 +57,7 @@ fn rewrite_use_transforms(svg: &str) -> std::borrow::Cow<'_, str> {
     let nested_re = NESTED_RE
         .get_or_init(|| regex::Regex::new(r"data:image/svg\+xml;base64,([A-Za-z0-9+/=]+)").unwrap());
 
-    // 1. ネスト SVG 画像の base64 を復号 → 再帰書き換え → 再エンコード。
+    // 1. Decode the base64 of nested SVG images -> rewrite recursively -> re-encode.
     let with_nested = nested_re.replace_all(svg, |c: &regex::Captures| {
         let decoded = STANDARD
             .decode(&c[1])
@@ -69,13 +72,13 @@ fn rewrite_use_transforms(svg: &str) -> std::borrow::Cow<'_, str> {
         }
     });
 
-    // 2. このレベルの <use transform> を g ラップへ。
+    // 2. Wrap this level's <use transform> in a g.
     let rewritten =
         use_re.replace_all(&with_nested, |c: &regex::Captures| {
             format!("<g transform=\"{}\"><use{}{}/></g>", &c[2], &c[1], &c[3])
         });
 
-    // どちらの段でも変更が無ければ借用のまま返す。
+    // If neither stage made any change, return the borrowed value as is.
     if matches!(with_nested, std::borrow::Cow::Borrowed(_)) && matches!(rewritten, std::borrow::Cow::Borrowed(_))
     {
         std::borrow::Cow::Borrowed(svg)
@@ -101,33 +104,35 @@ impl Document for SvgDocument {
     }
 }
 
-/// グループを再帰的に走査し、可視パス/画像を `commands` に収集する。`prefix` は親から積んだ
-/// 追加 transform（ネスト SVG 画像の配置に使う）。トップレベルでは恒等。
+/// Recursively walks the group, collecting visible paths/images into `commands`. `prefix`
+/// is the additional transform accumulated from the parent (used for placing nested SVG
+/// images). It is the identity at the top level.
 fn walk(group: &usvg::Group, prefix: usvg::Transform, out: &mut Vec<DrawCommand>) {
     for node in group.children() {
         match node {
             usvg::Node::Group(g) => walk(g, prefix, out),
             usvg::Node::Path(p) => push_path(p, prefix, out),
             usvg::Node::Image(img) => convert_image(img, prefix, out),
-            // テキストは初回スコープ外（Typst/PDF の SVG では文字は Path 化されて来る）。
+            // Text is outside the initial scope (in Typst/PDF SVG, characters arrive turned into paths).
             usvg::Node::Text(_) => {}
         }
     }
 }
 
-/// `<image>` ノードを取り込む。ラスター（PNG/JPEG/GIF/WebP）は [`ImageData`] として、
-/// ネスト SVG（typst が `image("…​.svg")` で出す data:image/svg+xml）はそのツリーを辿って
-/// ベクターのまま取り込む（ベクター品質を保つ）。親グループのソフトマスク/クリップは未対応。
+/// Imports an `<image>` node. Raster (PNG/JPEG/GIF/WebP) is imported as [`ImageData`],
+/// while nested SVG (the data:image/svg+xml that typst emits via `image("…​.svg")`) is
+/// imported by traversing its tree and keeping it as vectors (preserving vector quality).
+/// Soft masks/clips on the parent group are not supported.
 fn convert_image(img: &usvg::Image, prefix: usvg::Transform, out: &mut Vec<DrawCommand>) {
     if !img.is_visible() {
         return;
     }
-    // 画像ローカル → 親キャンバスへの変換（親の prefix × 画像の絶対 transform）。
+    // Transform from image-local to the parent canvas (parent's prefix × image's absolute transform).
     let img_ts = prefix.pre_concat(img.abs_transform());
     match img.kind() {
         usvg::ImageKind::SVG(tree) => {
-            // ネスト SVG を画像ボックス(size)へ非一様スケールで合わせ（typst は
-            // preserveAspectRatio="none"）、その上に配置 transform を掛けて辿る。
+            // Fit the nested SVG into the image box (size) with a non-uniform scale (typst
+            // uses preserveAspectRatio="none"), then apply the placement transform on top and traverse it.
             let (bw, bh) = (img.size().width(), img.size().height());
             let (tw, th) = (tree.size().width(), tree.size().height());
             if tw <= 0.0 || th <= 0.0 {
@@ -144,8 +149,9 @@ fn convert_image(img: &usvg::Image, prefix: usvg::Transform, out: &mut Vec<DrawC
     }
 }
 
-/// ラスター画像をデコードして [`ImageData`] にする。配置矩形は絶対外接矩形（`abs_bounding_box`、
-/// 軸平行）に `prefix` を適用したもの。トップレベルでは prefix=恒等でそのまま。
+/// Decodes a raster image into [`ImageData`]. The placement rectangle is the absolute
+/// bounding rectangle (`abs_bounding_box`, axis-aligned) with `prefix` applied. At the top
+/// level, prefix=identity leaves it unchanged.
 fn decode_raster(kind: &usvg::ImageKind, img: &usvg::Image, prefix: usvg::Transform) -> Option<ImageData> {
     let bytes: &[u8] = match kind {
         usvg::ImageKind::JPEG(d)
@@ -167,7 +173,7 @@ fn decode_raster(kind: &usvg::ImageKind, img: &usvg::Image, prefix: usvg::Transf
     })
 }
 
-/// 点 (x, y) に transform を適用する（tiny-skia の行優先: x'=sx·x+kx·y+tx, y'=ky·x+sy·y+ty）。
+/// Applies a transform to the point (x, y) (tiny-skia row-major: x'=sx·x+kx·y+tx, y'=ky·x+sy·y+ty).
 fn map_pt(ts: &usvg::Transform, x: f32, y: f32) -> (f32, f32) {
     (ts.sx * x + ts.kx * y + ts.tx, ts.ky * x + ts.sy * y + ts.ty)
 }
@@ -176,8 +182,9 @@ fn push_path(path: &usvg::Path, prefix: usvg::Transform, out: &mut Vec<DrawComma
     if !path.is_visible() {
         return;
     }
-    // usvg の `data()` はローカル座標。要素の絶対 transform に親の prefix を積んで
-    // キャンバス座標へ変換する（`<use>` 配置のグリフ、viewBox→px、ネスト SVG が反映される）。
+    // usvg's `data()` is in local coordinates. Compose the parent's prefix onto the
+    // element's absolute transform to convert to canvas coordinates (this reflects glyphs
+    // placed by `<use>`, viewBox→px, and nested SVG).
     let ts = prefix.pre_concat(path.abs_transform());
     let data = if ts.is_identity() {
         path.data().clone()
@@ -191,8 +198,9 @@ fn push_path(path: &usvg::Path, prefix: usvg::Transform, out: &mut Vec<DrawComma
     if segments.is_empty() {
         return;
     }
-    // ストローク幅・破線間隔もジオメトリと同じ縮尺で変換する（ネスト SVG を縮小配置した図の
-    // 軸線が太くならないように）。非一様スケールでも近似となるよう面積比の平方根を使う。
+    // Transform the stroke width and dash spacing at the same scale as the geometry (so the
+    // axis lines of a figure placed by shrinking a nested SVG don't become thick). Use the
+    // square root of the area ratio so it remains an approximation even under non-uniform scale.
     let scale = (ts.sx * ts.sy - ts.kx * ts.ky).abs().sqrt();
     let fill = path.fill().and_then(convert_fill);
     let stroke = path.stroke().and_then(|s| convert_stroke(s, scale));
@@ -200,7 +208,7 @@ fn push_path(path: &usvg::Path, prefix: usvg::Transform, out: &mut Vec<DrawComma
         return;
     }
 
-    // 破線指定があれば、塗りは元パスで、ストロークは破線オン区間に分割したパスで描く。
+    // If a dash pattern is specified, draw the fill with the original path and the stroke with the path split into dash-on intervals.
     let dash = path
         .stroke()
         .and_then(|s| s.dasharray().map(|d| (d.to_vec(), s.dashoffset())));
@@ -230,17 +238,18 @@ fn push_path(path: &usvg::Path, prefix: usvg::Transform, out: &mut Vec<DrawComma
     }
 }
 
-/// 破線パターンに従ってパスを「オン区間」の線分群に分割する。`pattern`/`offset` はローカル単位
-/// なので `scale` でキャンバス単位へ。曲線は折れ線に平坦化してから等長で刻む。
+/// Splits a path into line segments of "on intervals" according to the dash pattern.
+/// `pattern`/`offset` are in local units, so convert them to canvas units via `scale`.
+/// Curves are flattened to polylines first, then stepped at equal lengths.
 fn dash_segments(segments: &[PathSegment], pattern: &[f32], offset: f32, scale: f32) -> Vec<PathSegment> {
     let mut pat: Vec<f32> = pattern.iter().map(|v| (v * scale).max(0.0)).collect();
     if pat.len() % 2 == 1 {
         let dup = pat.clone();
-        pat.extend(dup); // SVG: 奇数長は2周ぶんで偶数化。
+        pat.extend(dup); // SVG: an odd length is made even by repeating it twice.
     }
     let period: f32 = pat.iter().sum();
     if period <= 1e-6 {
-        return segments.to_vec(); // 全0は実線扱い。
+        return segments.to_vec(); // All zeros is treated as a solid line.
     }
 
     let mut out = Vec::new();
@@ -250,7 +259,7 @@ fn dash_segments(segments: &[PathSegment], pattern: &[f32], offset: f32, scale: 
     out
 }
 
-/// セグメント列を部分パスごとの折れ線（点列）に平坦化する。
+/// Flattens the segment list into a polyline (point list) per subpath.
 fn flatten(segments: &[PathSegment]) -> Vec<Vec<[f32; 2]>> {
     let mut polys = Vec::new();
     let mut cur: Vec<[f32; 2]> = Vec::new();
@@ -295,7 +304,7 @@ fn flatten(segments: &[PathSegment]) -> Vec<Vec<[f32; 2]>> {
     polys
 }
 
-/// 2次/3次ベジェを固定分割で折れ線化して `out` に追加する（始点は既出なので終点側のみ）。
+/// Flattens a quadratic/cubic Bezier into a polyline with a fixed subdivision and appends it to `out` (the start point is already present, so only the end side).
 fn flatten_bezier(p0: [f32; 2], ctrl: [[f32; 2]; 2], p3: [f32; 2], quad: bool, out: &mut Vec<[f32; 2]>) {
     const N: usize = 16;
     for i in 1..=N {
@@ -318,9 +327,9 @@ fn flatten_bezier(p0: [f32; 2], ctrl: [[f32; 2]; 2], p3: [f32; 2], quad: bool, o
     }
 }
 
-/// 折れ線1本を破線パターンで刻み、オン区間を MoveTo/LineTo として `out` に追加する。
+/// Steps a single polyline by the dash pattern, appending the on intervals to `out` as MoveTo/LineTo.
 fn dash_polyline(poly: &[[f32; 2]], pat: &[f32], period: f32, offset: f32, out: &mut Vec<PathSegment>) {
-    // 開始位置をパターン内へ進める。
+    // Advance the start position into the pattern.
     let mut t = offset.rem_euclid(period);
     let mut idx = 0;
     let mut guard = 0;
@@ -398,7 +407,7 @@ fn convert_stroke(stroke: &usvg::Stroke, scale: f32) -> Option<Stroke> {
     })
 }
 
-/// Paint を単色に落とす。グラデーションは先頭ストップ色で近似、パターンは未対応。
+/// Reduces a Paint to a single color. Gradients are approximated by the first stop color; patterns are not supported.
 fn paint_color(paint: &usvg::Paint, opacity: f32) -> Option<Color> {
     let color = match paint {
         usvg::Paint::Color(c) => *c,

@@ -1,9 +1,10 @@
-//! ベクターレンダラー。[`Page`] のパスを lyon でテッセレーションし、wgpu の
-//! オフスクリーンレンダリング（ネイティブ解像度・MSAA）で RGBA8 バッファに描画する。
+//! Vector renderer. Tessellates the paths of a [`Page`] with lyon and draws them
+//! into an RGBA8 buffer via wgpu offscreen rendering (native resolution, MSAA).
 //!
-//! 「ベクター品質」を保つため、ズーム等で解像度が変わるたびに [`Renderer::render`] を
-//! 呼び直す（ビットマップ拡大ではなく毎回テッセレーション→ラスタライズし直す）想定。
-//! Kitty/Framebuffer どちらの出力でも、ここが生成する RGBA をそのまま流す。
+//! To preserve "vector quality", [`Renderer::render`] is meant to be called again
+//! every time the resolution changes (e.g. on zoom): instead of scaling up a bitmap,
+//! it re-tessellates and re-rasterizes each time. For both Kitty and Framebuffer
+//! output, the RGBA produced here is passed through as-is.
 
 use anyhow::{anyhow, Result};
 use bytemuck::{Pod, Zeroable};
@@ -18,7 +19,7 @@ use wgpu::util::DeviceExt;
 const SAMPLE_COUNT: u32 = 4;
 const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// ページ外（letterbox）の背景色。ビューア背景として暗色にし、ページ境界が見えるようにする。
+/// Background color outside the page (letterbox). Kept dark as the viewer background so the page boundary is visible.
 const LETTERBOX: wgpu::Color = wgpu::Color {
     r: 0.10,
     g: 0.10,
@@ -33,7 +34,7 @@ struct Vertex {
     color: [f32; 4],
 }
 
-/// 画像（テクスチャ付き矩形）の頂点。位置はページ座標、uv はテクスチャ座標。
+/// Vertex of an image (a textured rectangle). Position is in page coordinates, uv is in texture coordinates.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ImageVertex {
@@ -44,12 +45,12 @@ struct ImageVertex {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Uniforms {
-    /// 表示するページ内矩形（ビューポート）= [原点x, 原点y, 幅, 高さ]（ページ座標）。
-    /// この矩形が出力テクスチャ全体にマッピングされる。ズーム＝矩形を小さく、パン＝原点移動。
+    /// The rectangle within the page to display (the viewport) = [origin x, origin y, width, height] (page coordinates).
+    /// This rectangle is mapped onto the entire output texture. Zooming shrinks the rectangle; panning moves its origin.
     viewport: [f32; 4],
 }
 
-/// lyon の頂点に塗り色を付与するコンストラクタ。
+/// Constructor that attaches a fill color to lyon vertices.
 struct WithColor {
     color: [f32; 4],
 }
@@ -77,17 +78,17 @@ pub struct Renderer {
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
-    /// 画像（テクスチャ付き矩形）描画用パイプラインとレイアウト・サンプラ。
+    /// Pipeline, layout, and sampler for drawing images (textured rectangles).
     image_pipeline: wgpu::RenderPipeline,
     image_bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    /// 選択されたアダプタ名（デバッグ表示用）。
+    /// Name of the selected adapter (for debug display).
     pub adapter_info: String,
 }
 
 impl Renderer {
-    /// wgpu をヘッドレス初期化する。bare TTY でも動くよう Vulkan を優先し、
-    /// 取得できなければソフトウェアフォールバック（lavapipe 等）に切り替える。
+    /// Initializes wgpu headlessly. Prefers Vulkan so it works even on a bare TTY,
+    /// and falls back to a software adapter (e.g. lavapipe) if none can be acquired.
     pub fn new() -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
@@ -103,14 +104,14 @@ impl Renderer {
             compatible_surface: None,
         }))
         .or_else(|_| {
-            // ハードウェアアダプタが取れない場合はソフトウェアにフォールバック。
+            // Fall back to software if no hardware adapter is available.
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::LowPower,
                 force_fallback_adapter: true,
                 compatible_surface: None,
             }))
         })
-        .map_err(|e| anyhow!("GPU アダプタを取得できませんでした: {e}"))?;
+        .map_err(|e| anyhow!("failed to acquire a GPU adapter: {e}"))?;
 
         let info = adapter.get_info();
         let adapter_info = format!("{} ({:?})", info.name, info.backend);
@@ -121,7 +122,7 @@ impl Renderer {
             required_limits: adapter.limits(),
             ..Default::default()
         }))
-        .map_err(|e| anyhow!("wgpu デバイス生成に失敗: {e}"))?;
+        .map_err(|e| anyhow!("failed to create wgpu device: {e}"))?;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("vecview-shader"),
@@ -183,7 +184,7 @@ impl Renderer {
             cache: None,
         });
 
-        // 画像用：uniform(viewport, 頂点) + テクスチャ + サンプラ（フラグメント）。
+        // For images: uniform (viewport, vertices) + texture + sampler (fragment).
         let image_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("vecview-image-bgl"),
@@ -278,10 +279,11 @@ impl Renderer {
         })
     }
 
-    /// `page` の `viewport`（[x, y, w, h] ページ座標）を `width`×`height` ピクセルの
-    /// RGBA8 バッファに描画して返す。viewport をページ全体にすれば全体表示、小さくすれば
-    /// その領域を高解像度で拡大描画する（ズーム/パン）。歪みを避けるため viewport の
-    /// アスペクト比は `width`/`height` に合わせること。
+    /// Renders the `viewport` of `page` ([x, y, w, h] in page coordinates) into a
+    /// `width`x`height` pixel RGBA8 buffer and returns it. Setting the viewport to the
+    /// whole page shows everything; making it smaller draws that region enlarged at high
+    /// resolution (zoom/pan). To avoid distortion, match the viewport's aspect ratio to
+    /// `width`/`height`.
     pub fn render(
         &self,
         page: &Page,
@@ -294,7 +296,7 @@ impl Renderer {
 
         let geometry = tessellate(page)?;
 
-        // MSAA 用マルチサンプルテクスチャと、その resolve 先（コピー元）テクスチャ。
+        // The multisample texture for MSAA and its resolve target (copy source) texture.
         let msaa = self.create_texture(width, height, SAMPLE_COUNT, wgpu::TextureUsages::RENDER_ATTACHMENT);
         let resolve = self.create_texture(
             width,
@@ -344,11 +346,11 @@ impl Renderer {
                 usage: wgpu::BufferUsages::INDEX,
             });
 
-        // 画像 GPU リソースをパス開始前に用意（テクスチャ・頂点・バインドグループ）。
-        // テクスチャはバインドグループが内部で参照を保持するが、念のため生存させておく。
+        // Prepare image GPU resources before the pass begins (textures, vertices, bind groups).
+        // The bind group holds an internal reference to each texture, but we keep them alive just in case.
         let image_draws = self.prepare_images(page, &uniform_buf);
 
-        // 読み戻しバッファ（256バイト行アライン必須）。
+        // Readback buffer (rows must be aligned to 256 bytes).
         let bytes_per_row = align_up(width * 4, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("vecview-readback"),
@@ -371,7 +373,7 @@ impl Renderer {
                     resolve_target: Some(&resolve_view),
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        // ページ外は暗色（letterbox）。ページ範囲は下記の白シート＋内容で塗る。
+                        // Outside the page is dark (letterbox). The page area is filled by the white sheet plus content below.
                         load: wgpu::LoadOp::Clear(LETTERBOX),
                         store: wgpu::StoreOp::Store,
                     },
@@ -390,8 +392,8 @@ impl Renderer {
                 pass.draw_indexed(0..geometry.indices.len() as u32, 0, 0..1);
             }
 
-            // ラスター画像をパスの上に合成する。z 順は「全パス→全画像」と単純化しており、
-            // ベクター注釈を画像の上に重ねる文書では前後関係が崩れる（PDF の図では実害なし）。
+            // Composite raster images on top of the paths. The z order is simplified to "all paths, then all images",
+            // so documents that overlay vector annotations on top of images get the ordering wrong (no real harm for PDF figures).
             if !image_draws.is_empty() {
                 pass.set_pipeline(&self.image_pipeline);
                 for img in &image_draws {
@@ -426,7 +428,7 @@ impl Renderer {
 
         self.queue.submit(Some(encoder.finish()));
 
-        // 同期読み戻し。
+        // Synchronous readback.
         let slice = readback.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
@@ -434,11 +436,11 @@ impl Renderer {
         });
         self.device.poll(wgpu::PollType::wait_indefinitely())?;
         rx.recv()
-            .map_err(|_| anyhow!("map_async コールバック消失"))?
-            .map_err(|e| anyhow!("バッファ map に失敗: {e:?}"))?;
+            .map_err(|_| anyhow!("map_async callback lost"))?
+            .map_err(|e| anyhow!("failed to map buffer: {e:?}"))?;
 
         let data = slice.get_mapped_range();
-        // パディングを除去して密な RGBA に詰め直す。
+        // Strip the padding and repack into tightly packed RGBA.
         let row_bytes = (width * 4) as usize;
         let mut out = Vec::with_capacity(row_bytes * height as usize);
         for row in 0..height as usize {
@@ -451,8 +453,8 @@ impl Renderer {
         Ok(out)
     }
 
-    /// ページ内の各画像について、テクスチャ・バインドグループ・頂点バッファを用意する。
-    /// `uniform_buf` は viewport（パスと共通の座標変換）。
+    /// Prepares a texture, bind group, and vertex buffer for each image in the page.
+    /// `uniform_buf` is the viewport (the same coordinate transform used by paths).
     fn prepare_images(&self, page: &Page, uniform_buf: &wgpu::Buffer) -> Vec<ImageDraw> {
         let mut draws = Vec::new();
         for cmd in &page.commands {
@@ -477,7 +479,7 @@ impl Renderer {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            // write_texture は 256 バイト行アライン不要（copy_buffer_to_texture と違う）。
+            // write_texture does not require 256-byte row alignment (unlike copy_buffer_to_texture).
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &texture,
@@ -552,15 +554,15 @@ impl Renderer {
     }
 }
 
-/// 1枚の画像を描くための GPU リソース束。`_texture` はバインドグループが内部参照を保持する
-/// ため直接は使わないが、明示的に生存させて安全側に倒す。
+/// Bundle of GPU resources for drawing a single image. `_texture` is held alive explicitly
+/// to be safe; it is not used directly since the bind group keeps an internal reference.
 struct ImageDraw {
     bind_group: wgpu::BindGroup,
     vertices: wgpu::Buffer,
     _texture: wgpu::Texture,
 }
 
-/// ページ座標の矩形 [x, y, w, h] を、テクスチャ全体を貼る2三角形（6頂点）に展開する。
+/// Expands a page-coordinate rectangle [x, y, w, h] into 2 triangles (6 vertices) that map the entire texture.
 fn image_quad(rect: [f32; 4]) -> [ImageVertex; 6] {
     let [x, y, w, h] = rect;
     let tl = ImageVertex { position: [x, y], uv: [0.0, 0.0] };
@@ -570,15 +572,16 @@ fn image_quad(rect: [f32; 4]) -> [ImageVertex; 6] {
     [tl, tr, br, tl, br, bl]
 }
 
-/// ページ内の全パスを1つの頂点/インデックスバッファにテッセレーションする（画像は別経路）。
+/// Tessellates all paths in the page into a single vertex/index buffer (images go through a separate path).
 fn tessellate(page: &Page) -> Result<VertexBuffers<Vertex, u32>> {
     let mut buffers: VertexBuffers<Vertex, u32> = VertexBuffers::new();
     let mut fill_tess = FillTessellator::new();
     let mut stroke_tess = StrokeTessellator::new();
 
-    // ページ背景の白シート。letterbox（暗色）の上にページ範囲だけ白を敷くことで、
-    // 背景を持たない透明 SVG でもページ境界が分かり、横長/縦長スライドの余白が黒帯になる。
-    // 自前で背景を塗る文書（Typst スライド等）はこの上から塗りつぶす。
+    // The white sheet for the page background. Laying down white only over the page area on top of the
+    // letterbox (dark) makes the page boundary visible even for transparent SVGs that have no background,
+    // and turns the margins of wide/tall slides into black bars. Documents that paint their own background
+    // (e.g. Typst slides) just paint over this.
     {
         use lyon::math::point;
         let mut builder = lyon::path::Path::builder();
@@ -594,12 +597,12 @@ fn tessellate(page: &Page) -> Result<VertexBuffers<Vertex, u32>> {
                 &FillOptions::default(),
                 &mut BuffersBuilder::new(&mut buffers, WithColor { color: [1.0, 1.0, 1.0, 1.0] }),
             )
-            .map_err(|e| anyhow!("背景テッセレーション失敗: {e:?}"))?;
+            .map_err(|e| anyhow!("background tessellation failed: {e:?}"))?;
     }
 
     for cmd in &page.commands {
         let DrawCommand::Path(path) = cmd else {
-            continue; // 画像は prepare_images / image_pipeline で別途描く。
+            continue; // Images are drawn separately via prepare_images / image_pipeline.
         };
         let lyon_path = build_path(&path.segments);
 
@@ -615,7 +618,7 @@ fn tessellate(page: &Page) -> Result<VertexBuffers<Vertex, u32>> {
                     &options,
                     &mut BuffersBuilder::new(&mut buffers, WithColor { color }),
                 )
-                .map_err(|e| anyhow!("fill テッセレーション失敗: {e:?}"))?;
+                .map_err(|e| anyhow!("fill tessellation failed: {e:?}"))?;
         }
 
         if let Some(stroke) = &path.stroke {
@@ -627,14 +630,14 @@ fn tessellate(page: &Page) -> Result<VertexBuffers<Vertex, u32>> {
                     &options,
                     &mut BuffersBuilder::new(&mut buffers, WithColor { color }),
                 )
-                .map_err(|e| anyhow!("stroke テッセレーション失敗: {e:?}"))?;
+                .map_err(|e| anyhow!("stroke tessellation failed: {e:?}"))?;
         }
     }
 
     Ok(buffers)
 }
 
-/// core のセグメント列から lyon のパスを構築する。
+/// Builds a lyon path from core's segment list.
 fn build_path(segments: &[PathSegment]) -> lyon::path::Path {
     use lyon::math::point;
     let mut builder = lyon::path::Path::builder();
@@ -699,7 +702,7 @@ struct VsOut {
 @vertex
 fn vs(@location(0) position: vec2<f32>, @location(1) color: vec4<f32>) -> VsOut {
     var out: VsOut;
-    // viewport = [x, y, w, h]。viewport 矩形を NDC [-1,1] にマッピング（Y反転）。
+    // viewport = [x, y, w, h]. Map the viewport rectangle into NDC [-1,1] (Y flipped).
     let ndc = vec2<f32>(
         (position.x - u.viewport.x) / u.viewport.z * 2.0 - 1.0,
         1.0 - (position.y - u.viewport.y) / u.viewport.w * 2.0,
@@ -714,7 +717,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     return in.color;
 }
 
-// --- 画像（テクスチャ付き矩形）---
+// --- Images (textured rectangles) ---
 @group(0) @binding(1) var img_tex: texture_2d<f32>;
 @group(0) @binding(2) var img_samp: sampler;
 
@@ -746,8 +749,8 @@ mod tests {
     use super::*;
     use vecview_core::{Color, Fill, PathData};
 
-    /// 赤い矩形でページ全体を塗り、中心ピクセルが赤く描画されることを確認する。
-    /// wgpu のヘッドレス GPU 経路がこの環境で動くことの検証も兼ねる。
+    /// Fills the whole page with a red rectangle and checks that the center pixel is drawn red.
+    /// Also serves to verify that wgpu's headless GPU path works in this environment.
     #[test]
     fn renders_red_rect() {
         let page = Page {
@@ -769,7 +772,7 @@ mod tests {
             })],
         };
 
-        let renderer = Renderer::new().expect("wgpu 初期化");
+        let renderer = Renderer::new().expect("wgpu init");
         eprintln!("adapter: {}", renderer.adapter_info);
         let (w, h) = (64u32, 64u32);
         let rgba = renderer
@@ -777,10 +780,10 @@ mod tests {
             .expect("render");
         assert_eq!(rgba.len(), (w * h * 4) as usize);
 
-        // 中心ピクセル。
+        // Center pixel.
         let idx = ((h / 2 * w + w / 2) * 4) as usize;
         let (r, g, b, a) = (rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]);
         eprintln!("center pixel = ({r}, {g}, {b}, {a})");
-        assert!(r > 200 && g < 60 && b < 60, "中心が赤でない: ({r},{g},{b},{a})");
+        assert!(r > 200 && g < 60 && b < 60, "center is not red: ({r},{g},{b},{a})");
     }
 }

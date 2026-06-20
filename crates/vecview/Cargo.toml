@@ -3,7 +3,7 @@ name = "vecview"
 version.workspace = true
 edition.workspace = true
 
-# パッケージ（正式名称）は vecview のまま、インストールされるコマンド名は短い vv にする。
+# The package (full name) stays vecview; the installed command is the short vv.
 [[bin]]
 name = "vv"
 path = "src/main.rs"
@@ -22,7 +22,7 @@ crossterm.workspace = true
 base64.workspace = true
 ctrlc = "3"
 toml = "0.8"
-# ヘッドレス描画（--render）の PNG 出力に使う。
+# Used for PNG output in headless rendering (--render).
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]

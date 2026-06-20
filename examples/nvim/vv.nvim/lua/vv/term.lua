@@ -1,18 +1,18 @@
---- 端末グラフィクス層：Kitty graphics protocol で PNG を端末へ直接描く（純 Lua・依存なし）。
+--- Terminal graphics layer: draw a PNG directly to the terminal via the Kitty graphics protocol (pure Lua, no dependencies).
 ---
---- nvim の :terminal(libvterm) は kitty graphics を通せないため、nvim のグリッドではなく
---- 外側端末（fd 1）へ生バイトを書く。nvim 0.11 には nvim_ui_send が無いので vim.uv の TTY
---- ハンドル（無ければ io.stdout）を使う ── これは image.nvim と同じ方式。
---- tmux 内では passthrough（ESC 二重化 + DCS 包み）でラップする。
+--- nvim's :terminal (libvterm) cannot pass kitty graphics through, so we write raw bytes to the outer
+--- terminal (fd 1) rather than nvim's grid. nvim 0.11 has no nvim_ui_send, so we use vim.uv's TTY
+--- handle (or io.stdout if unavailable) -- the same approach as image.nvim.
+--- Inside tmux, wrap in passthrough (ESC doubling + DCS wrapping).
 ---
---- 画像は「直接データ転送（t=d）をチャンク分割」で送る。ファイルパス転送（t=f）と違い、
---- SSH 越し（端末が remote のファイルを読めない）でも動く。
+--- Images are sent as "direct data transfer (t=d) split into chunks". Unlike file-path transfer (t=f),
+--- this also works over SSH (where the terminal cannot read the remote's files).
 
 local M = {}
 
 local ESC = "\27"
 
--- fd 1 を TTY ハンドルとして一度だけ開いて使い回す。
+-- Open fd 1 as a TTY handle once and reuse it.
 local tty
 local function out()
 	if tty == nil then
@@ -35,7 +35,7 @@ local function write(bytes)
 	end
 end
 
--- tmux 内なら passthrough でラップ（内側 ESC を二重化し \ePtmux;…\e\\ で包む）。
+-- If inside tmux, wrap in passthrough (double the inner ESC and wrap it in \ePtmux;…\e\\).
 local in_tmux = vim.env.TMUX ~= nil
 local function wrap(seq)
 	if not in_tmux then
@@ -44,9 +44,9 @@ local function wrap(seq)
 	return ESC .. "Ptmux;" .. seq:gsub(ESC, ESC .. ESC) .. ESC .. "\\"
 end
 
--- tmux 内では passthrough のカーソル位置指定がパネル変換を介さず物理スクリーン座標になるため、
--- nvim 相対座標に自パネルの左上オフセット（pane_left/pane_top）を足して物理座標へ変換する
--- （image.nvim と同じ）。$TMUX_PANE で自パネルを対象に取得する。
+-- Inside tmux, passthrough cursor positioning bypasses pane translation and uses physical screen coordinates,
+-- so we add this pane's top-left offset (pane_left/pane_top) to the nvim-relative coordinates to convert to physical coordinates
+-- (same as image.nvim). $TMUX_PANE targets this pane for the query.
 local function pane_offset()
 	if not in_tmux then
 		return 0, 0
@@ -62,8 +62,8 @@ local function pane_offset()
 	return tonumber(l) or 0, tonumber(t) or 0
 end
 
---- PNG ファイルを画像 ID `id` として、スクリーンセル (row,col)（1始まり）へ cols×rows セルに
---- 収めて表示する。直接データ転送（t=d, f=100=PNG）。寸法は PNG ヘッダから端末が読む。
+--- Display a PNG file as image ID `id`, fitting it into cols×rows cells at screen cell (row,col) (1-based).
+--- Direct data transfer (t=d, f=100=PNG). The terminal reads the dimensions from the PNG header.
 function M.show(png_path, id, row, col, cols, rows)
 	local f = io.open(png_path, "rb")
 	if not f then
@@ -76,16 +76,16 @@ function M.show(png_path, id, row, col, cols, rows)
 	end
 	local payload = vim.base64.encode(data)
 
-	-- tmux パネルのオフセットを足して物理スクリーン座標へ（passthrough は物理座標になるため）。
+	-- Add the tmux pane offset to convert to physical screen coordinates (since passthrough uses physical coordinates).
 	local off_l, off_t = pane_offset()
 	row = row + off_t
 	col = col + off_l
 
-	-- 同期出力開始 → カーソル保存 → フロート左上へ移動（この後の転送完了時にそこへ表示される）。
+	-- Begin synchronized output -> save cursor -> move to the float's top-left (the image appears there once the transfer below completes).
 	write(wrap(ESC .. "[?2026h" .. ESC .. "[s" .. ESC .. "[" .. row .. ";" .. col .. "H"))
 
-	-- base64 を 4096 バイトごとに分割。最初のチャンクに制御キー、m=1 継続 / m=0 終端。
-	-- C=1 はカーソルを動かさない指定。c/r でフロートのセル数へスケールさせる。
+	-- Split the base64 into 4096-byte chunks. Control keys go in the first chunk; m=1 means continue / m=0 means end.
+	-- C=1 specifies that the cursor must not move. c/r scale to the float's cell counts.
 	local CHUNK = 4096
 	local n = #payload
 	local i = 1
@@ -104,12 +104,12 @@ function M.show(png_path, id, row, col, cols, rows)
 		write(wrap(ESC .. "_G" .. ctrl .. ";" .. piece .. ESC .. "\\"))
 	end
 
-	-- カーソル復帰 + 同期出力終了。
+	-- Restore cursor + end synchronized output.
 	write(wrap(ESC .. "[u" .. ESC .. "[?2026l"))
 	return true
 end
 
---- 画像 ID `id` の画像と placement を解放する（d=I=データごと削除）。
+--- Free image ID `id`'s image and placement (d=I = delete along with the data).
 function M.clear(id)
 	write(wrap(ESC .. "_Ga=d,d=I,i=" .. id .. ",q=2" .. ESC .. "\\"))
 end

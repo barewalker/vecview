@@ -1,11 +1,13 @@
-//! vecview CLI エントリポイント。
+//! vecview CLI entry point.
 //!
-//! `vecview <FILE>` で SVG / Typst / PDF をターミナル内にベクター表示する。Typst（`.typ`）は
-//! 内部で `typst watch` を起動して SVG を生成し、その SVG を監視してライブ再描画する。
-//! PDF（`.pdf`）は `pdfium` で表示解像度に直接ラスタライズし、元 PDF を監視して保存のたびに
-//! 開き直す。いずれもブラウザ不要・ターミナル内完結のプレビューを実現する。
+//! `vecview <FILE>` displays SVG / Typst / PDF as vector graphics inside the terminal. For Typst
+//! (`.typ`), it launches `typst watch` internally to generate SVG, then watches that SVG and
+//! live-redraws. For PDF (`.pdf`), it rasterizes directly at the display resolution with `pdfium`,
+//! watches the source PDF, and reopens it on every save. In all cases this gives a no-browser,
+//! fully-in-terminal preview.
 //!
-//! 端末（TTY）で起動するとインタラクティブモードになり、キーでズーム・ページ送り・終了できる。
+//! When launched in a terminal (TTY) it runs in interactive mode, with keys for zoom, page
+//! navigation, and quitting.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -25,34 +27,34 @@ use vecview_output::detect_backend;
 use vecview_renderer::Renderer;
 use vecview_svg::SvgDocument;
 
-/// 再描画ループへのメッセージ。
+/// Message to the redraw loop.
 enum Msg {
-    /// 監視対象ファイルが変更された。
+    /// A watched file changed.
     Reload,
-    /// 終了要求（Ctrl-C 等）。
+    /// Quit request (Ctrl-C, etc.).
     Quit,
-    /// キー入力。
+    /// Key input.
     Key(KeyEvent),
-    /// マウス入力（テキスト選択用）。
+    /// Mouse input (for text selection).
     Mouse(MouseEvent),
 }
 
-/// 表示ソース。SVG/Typst はページ SVG ファイル、PDF は pdfium で直接描画する。
+/// Display source. SVG/Typst use per-page SVG files; PDF is drawn directly by pdfium.
 #[derive(Clone)]
 enum Source {
-    /// 単一 SVG ファイル。
+    /// A single SVG file.
     Svg(PathBuf),
-    /// Typst（`typst watch` が `vecview-<stem>-<tag>-<p>.svg` をページごとに出力）。
-    /// `tag` はプロセス固有（PID）。同じ文書を複数インスタンスで開いても出力パスが衝突せず、
-    /// 互いのファイルを取り合ったり消し合ったりしないようにする。
+    /// Typst (`typst watch` emits `vecview-<stem>-<tag>-<p>.svg`, one file per page).
+    /// `tag` is process-specific (PID). Opening the same document in multiple instances avoids
+    /// output-path collisions, so instances don't fight over or delete each other's files.
     Typst { dir: PathBuf, stem: String, tag: u32 },
-    /// PDF（pdfium で直接ラスタライズ。ファイルは持たず、ドキュメントは main 側で保持）。
-    /// 元 PDF を監視し、保存のたび開き直す。
+    /// PDF (rasterized directly by pdfium; holds no file, the document is kept on the main side).
+    /// Watches the source PDF and reopens it on every save.
     Pdf { pdf: PathBuf },
 }
 
 impl Source {
-    /// ページ `idx`（0始まり）の SVG パス（SVG/Typst のみ。PDF はファイルベースでないため未使用）。
+    /// SVG path for page `idx` (0-based) (SVG/Typst only; unused for PDF since it isn't file-based).
     fn page_path(&self, idx: usize) -> PathBuf {
         match self {
             Source::Svg(p) => p.clone(),
@@ -63,7 +65,8 @@ impl Source {
         }
     }
 
-    /// SVG=1、Typst=連番ファイル数。PDF は pdfium のページ数を使うため [`current_page_count`] 側で扱う。
+    /// SVG=1, Typst=number of sequential files. PDF uses pdfium's page count, handled in
+    /// [`current_page_count`].
     fn page_count(&self) -> usize {
         match self {
             Source::Svg(_) | Source::Pdf { .. } => 1,
@@ -71,7 +74,8 @@ impl Source {
         }
     }
 
-    /// 監視すべきディレクトリ。Typst は生成先、PDF/SVG は元ファイルのあるディレクトリ。
+    /// The directory to watch. For Typst, the output directory; for PDF/SVG, the directory holding
+    /// the source file.
     fn watch_dir(&self) -> PathBuf {
         let base = match self {
             Source::Svg(p) => p.parent().map(Path::to_path_buf),
@@ -82,8 +86,9 @@ impl Source {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
-    /// 終了時に自インスタンスが生成した一時ファイルを掃除する（Typst のみ）。PID 付きパスなので
-    /// 他インスタンス（同じ文書を開いている別プロセス含む）のファイルは消さない。
+    /// On exit, clean up the temp files this instance created (Typst only). Because paths include
+    /// the PID, files belonging to other instances (including other processes viewing the same
+    /// document) are never deleted.
     fn cleanup(&self) {
         if let Source::Typst { dir, stem, tag } = self {
             let prefix = format!("vecview-{stem}-{tag}-");
@@ -99,7 +104,7 @@ impl Source {
         }
     }
 
-    /// 変更パスがこのソースの監視対象（ページファイル、または元 PDF）か。
+    /// Whether the changed path is something this source watches (a page file, or the source PDF).
     fn owns(&self, path: &Path) -> bool {
         match self {
             Source::Svg(p) => path == p,
@@ -118,10 +123,11 @@ impl Source {
     }
 }
 
-/// Typst の現在ページ数＝連番ページ SVG の存在数。mtime での判定はしない（コンパイル中の
-/// ページ書き込みの一瞬を踏むと現行ページを古いと誤判定してページ数が落ち、表示が消える競合が
-/// 起きるため）。版縮小で取り残された古いページの除去は、コンパイル完了後に
-/// [`prune_stale_typst_pages`] が安全に削除する。
+/// Typst's current page count = number of sequential page SVGs that exist. We don't decide based
+/// on mtime (hitting the brief moment when a page is being written during compilation would
+/// misjudge a current page as stale, dropping the page count and making the display vanish — a
+/// race). Removal of old pages left behind when the edition shrinks is handled safely after
+/// compilation finishes by [`prune_stale_typst_pages`].
 fn typst_page_count(dir: &Path, stem: &str, tag: u32) -> usize {
     let mut n = 0;
     while dir
@@ -133,10 +139,12 @@ fn typst_page_count(dir: &Path, stem: &str, tag: u32) -> usize {
     n.max(1)
 }
 
-/// 版が縮んで取り残された自インスタンスの末尾ページ SVG を削除する。typst は1コンパイルで現行
-/// ページを十数 ms 内に全て書くため、現行ページは最新 mtime の密なクラスタになる。末尾から見て、
-/// 最新 mtime より明確に古い（`margin` 超）連続ぶんだけを取り残しとみなして消す。コンパイル完了後
-/// （debounce 済み Reload 時）に呼ぶ前提なので、書き込み途中の現行ページを誤って消さない。
+/// Delete trailing page SVGs from this instance left behind when the edition shrinks. Since typst
+/// writes all current pages within a few dozen ms in a single compilation, the current pages form
+/// a dense cluster at the latest mtime. Scanning from the end, only the contiguous run that is
+/// clearly older than the latest mtime (beyond `margin`) is treated as leftover and removed. This
+/// is meant to be called after compilation finishes (on a debounced Reload), so it won't
+/// mistakenly delete a current page that's still being written.
 fn prune_stale_typst_pages(dir: &Path, stem: &str, tag: u32) {
     let mut entries: Vec<(PathBuf, SystemTime)> = Vec::new();
     let mut n = 0;
@@ -154,8 +162,9 @@ fn prune_stale_typst_pages(dir: &Path, stem: &str, tag: u32) {
         return;
     };
     let margin = Duration::from_secs(1);
-    // 末尾（高ページ番号）から、latest より margin 超古いファイルだけ削除し、新しいクラスタに
-    // 達したら止める（先頭側の現行ページには触れない）。取り残しは常に末尾の連続ぶん。
+    // From the end (high page numbers), delete only files older than `latest` by more than
+    // `margin`, stopping once we reach the newer cluster (never touching the current pages near
+    // the front). Leftovers are always a contiguous run at the end.
     for (path, t) in entries.iter().rev() {
         let stale = latest.duration_since(*t).map(|d| d > margin).unwrap_or(false);
         if !stale {
@@ -165,7 +174,8 @@ fn prune_stale_typst_pages(dir: &Path, stem: &str, tag: u32) {
     }
 }
 
-/// 現在のページ数。PDF は開いている pdfium ドキュメントの値、SVG/Typst は [`Source::page_count`]。
+/// The current page count. For PDF, the value from the open pdfium document; for SVG/Typst,
+/// [`Source::page_count`].
 fn current_page_count(source: &Source, pdf: Option<&vecview_pdf::Pdf>) -> usize {
     match source {
         Source::Pdf { .. } => pdf.map(|p| p.page_count()).unwrap_or(1),
@@ -174,39 +184,42 @@ fn current_page_count(source: &Source, pdf: Option<&vecview_pdf::Pdf>) -> usize 
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "vv", version, about = "vecview - ベクターグラフィクスをターミナルに表示する")]
+#[command(name = "vv", version, about = "vecview - display vector graphics in the terminal")]
 struct Args {
-    /// 表示するファイル（SVG / Typst .typ / PDF）。
+    /// File to display (SVG / Typst .typ / PDF).
     file: PathBuf,
 
-    /// 初期ズーム倍率（%）。
+    /// Initial zoom factor (%).
     #[arg(short, long, default_value_t = 100)]
     zoom: u32,
 
-    /// 出力バックエンド強制指定 [kitty|tmux|sixel|framebuffer]。環境変数 VECVIEW_BACKEND でも可。
+    /// Force the output backend [kitty|tmux|sixel|framebuffer]. Can also be set via the
+    /// VECVIEW_BACKEND environment variable.
     #[arg(short, long)]
     backend: Option<String>,
 
-    /// スーパーサンプリング倍率（1..=4）。tmux 表示のシャープさと引き換えに転送量が倍率²で増え、
-    /// 連続操作で端末が画像更新を捌けず落ちることがある。未指定なら環境変数 VECVIEW_SCALE、
-    /// それも無ければ 1（等倍）。端末が耐えるなら 2 以上でシャープに。
+    /// Supersampling factor (1..=4). In exchange for sharper tmux display, transfer size grows with
+    /// the square of the factor, and under continuous operation the terminal may fail to keep up
+    /// with image updates and crash. If unset, the VECVIEW_SCALE environment variable, otherwise 1
+    /// (native scale). Use 2 or higher for sharpness if your terminal can handle it.
     #[arg(short, long)]
     scale: Option<u32>,
 
-    /// ヘッドレス描画モード。対話せず1ページを PNG に描いて終了する（yazi / nvim 連携の土台）。
-    /// `--size` 必須。出力は `--output`（既定は stdout）。
+    /// Headless render mode. Draws one page to PNG without interaction and exits (the foundation
+    /// for yazi / nvim integration). Requires `--size`. Output goes to `--output` (default stdout).
     #[arg(long)]
     render: bool,
 
-    /// ヘッドレス描画の出力ピクセルサイズ `幅x高`（例 `800x1000`）。`--render` 時に必須。
+    /// Output pixel size `WxH` for headless render (e.g. `800x1000`). Required with `--render`.
     #[arg(long)]
     size: Option<String>,
 
-    /// ヘッドレス描画の出力先。PNG パス、または `-` で stdout。`--render` 時のみ有効（既定 `-`）。
+    /// Output destination for headless render. A PNG path, or `-` for stdout. Only valid with
+    /// `--render` (default `-`).
     #[arg(short, long)]
     output: Option<String>,
 
-    /// 描画するページ（1始まり）。`--render` 時のみ有効（既定 1）。
+    /// Page to render (1-based). Only valid with `--render` (default 1).
     #[arg(long, default_value_t = 1)]
     page: usize,
 }
@@ -214,23 +227,25 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     let scale = resolve_scale(args.scale);
-    // 出力バックエンドは CLI 引数 > 環境変数 VECVIEW_BACKEND（未指定なら自動検出）。
+    // Output backend: CLI argument > VECVIEW_BACKEND environment variable (auto-detected if unset).
     let backend_choice = args
         .backend
         .clone()
         .or_else(|| std::env::var("VECVIEW_BACKEND").ok());
 
-    // 診断モード：VECVIEW_PROBE=1 で端末が報告するサイズを表示して終了する（解像度調査用）。
+    // Diagnostic mode: with VECVIEW_PROBE=1, print the sizes the terminal reports and exit (for
+    // investigating resolution).
     if std::env::var_os("VECVIEW_PROBE").is_some() {
         probe_and_exit(backend_choice.as_deref(), scale);
     }
 
     if !args.file.exists() {
-        bail!("ファイルが見つかりません: {}", args.file.display());
+        bail!("file not found: {}", args.file.display());
     }
 
-    // ヘッドレス描画モード（--render）：端末も対話もなしで1ページを PNG に描いて即終了する。
-    // yazi の previewer や nvim プラグインが「指定サイズの画像を1枚作る」ために使う土台。
+    // Headless render mode (--render): draw one page to PNG with no terminal and no interaction,
+    // then exit immediately. The foundation a yazi previewer or nvim plugin uses to "produce a
+    // single image at a given size."
     if args.render {
         return render_headless(&args);
     }
@@ -242,11 +257,11 @@ fn main() -> Result<()> {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    // PDF は pdfium で直接描画する（pdftocairo→SVG→usvg 経路はネスト <use> の transform
-    // 二重適用バグで図がずれるため）。開いたドキュメントはここで保持する。
+    // PDF is drawn directly with pdfium (the pdftocairo->SVG->usvg path shifts figures due to a
+    // double-application-of-transform bug on nested <use>). The opened document is kept here.
     let mut pdf_doc: Option<vecview_pdf::Pdf> = None;
 
-    // Typst は typst watch を起動して SVG を生成。SVG はそのまま監視。
+    // Typst launches `typst watch` to generate SVG. SVG is watched as-is.
     let (source, mut child) = match ext.as_str() {
         "typ" => {
             let (source, child) = spawn_typst_watch(&args.file)?;
@@ -258,18 +273,19 @@ fn main() -> Result<()> {
         }
         "pdf" => {
             let canonical = std::fs::canonicalize(&args.file).unwrap_or_else(|_| args.file.clone());
-            pdf_doc = Some(vecview_pdf::Pdf::open(&canonical).context("PDF を開けません")?);
+            pdf_doc = Some(vecview_pdf::Pdf::open(&canonical).context("cannot open PDF")?);
             (Source::Pdf { pdf: canonical }, None)
         }
-        other => bail!("未対応の拡張子です: .{other}（svg / typ / pdf のみ対応）"),
+        other => bail!("unsupported extension: .{other} (only svg / typ / pdf are supported)"),
     };
 
     let backend = detect_backend(backend_choice.as_deref());
-    // GPU レンダラーは SVG/Typst のベクター描画にのみ使う。PDF は pdfium が描画するので初期化しない。
+    // The GPU renderer is used only for SVG/Typst vector drawing. PDF is drawn by pdfium, so we
+    // don't initialize it.
     let renderer = if matches!(source, Source::Pdf { .. }) {
         None
     } else {
-        Some(Renderer::new().context("レンダラー初期化")?)
+        Some(Renderer::new().context("renderer initialization")?)
     };
     eprintln!(
         "vecview: backend={} | {} | {}",
@@ -280,7 +296,7 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| "engine=pdfium".to_string()),
         source.watch_dir().display()
     );
-    // キーバインドを設定ファイル＋既定値から構築する。
+    // Build the key bindings from the config file plus defaults.
     let keymap = Keymap::load();
     let help_key = keymap
         .help
@@ -288,10 +304,10 @@ fn main() -> Result<()> {
         .find(|(n, _)| *n == "help")
         .and_then(|(_, k)| k.first().cloned())
         .unwrap_or_else(|| "?".to_string());
-    eprintln!("操作: {help_key} でヘルプ表示（キーは {} で変更可）", config_path().map(|p| p.display().to_string()).unwrap_or_default());
+    eprintln!("controls: press {help_key} for help (keys can be changed in {})", config_path().map(|p| p.display().to_string()).unwrap_or_default());
 
-    // ファイル監視（親ディレクトリを NonRecursive で監視し atomic rename を取りこぼさない）。
-    // 対象ソースのページファイル以外の変更（temp_dir のノイズ等）は無視する。
+    // File watching (watch the parent directory NonRecursive so atomic renames aren't missed).
+    // Changes other than the target source's page files (temp_dir noise, etc.) are ignored.
     let (tx, rx) = mpsc::channel::<Msg>();
     let watch_tx = tx.clone();
     let owns_source = source.clone();
@@ -315,13 +331,13 @@ fn main() -> Result<()> {
     ctrlc::set_handler(move || {
         let _ = quit_tx.send(Msg::Quit);
     })
-    .context("Ctrl-C ハンドラ設定")?;
+    .context("Ctrl-C handler setup")?;
 
-    // TTY ならインタラクティブ（raw mode + キー入力スレッド）。
+    // If a TTY, run interactively (raw mode + key input thread).
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
     if interactive {
         crossterm::terminal::enable_raw_mode().ok();
-        // テキスト選択のためマウスレポートを有効化する（終了時に無効化）。
+        // Enable mouse reporting for text selection (disabled on exit).
         crossterm::execute!(std::io::stdout(), EnableMouseCapture).ok();
         let key_tx = tx.clone();
         std::thread::spawn(move || loop {
@@ -342,7 +358,8 @@ fn main() -> Result<()> {
         });
     }
 
-    // 代替スクリーンへ切替（終了時に端末状態を復元し、描画した画像を残さない）。
+    // Switch to the alternate screen (restore terminal state on exit, leaving no drawn images
+    // behind).
     backend.enter().ok();
 
     let mut state = ViewState {
@@ -358,13 +375,13 @@ fn main() -> Result<()> {
         last_viewport: None,
         status: None,
     };
-    // 最後に描画した (ページ, mtime)。描画のたびに SVG を読むと atime が変わり notify が
-    // 再発火する（自己トリガー）ため、同一ページで mtime 不変なら描画しない。
+    // The last drawn (page, mtime). Reading the SVG on every draw changes its atime and re-fires
+    // notify (self-trigger), so we skip drawing if the page is the same and the mtime is unchanged.
     let mut last_render: Option<(usize, SystemTime)> = None;
-    // copy mode のキャレット移動で使い回す、選択オーバーレイ適用前のベース画像。
+    // Base image (before the selection overlay) reused across caret moves in copy mode.
     let mut base_frame: Option<BaseFrame> = None;
 
-    // 初回描画（.typ は生成待ちのため存在しないことがある）。
+    // Initial draw (a .typ may not exist yet since it's still being generated).
     render_current(
         &source,
         pdf_doc.as_ref(),
@@ -375,20 +392,23 @@ fn main() -> Result<()> {
         &mut base_frame,
     );
 
-    // tmux passthrough sixel は tmux に消されるため、入力待ちをタイムアウトさせて定期的に
-    // 直近フレームを再送し復元する。間隔は VECVIEW_REDRAW_MS（既定 1000ms、最小 100ms）。
+    // tmux passthrough sixel gets cleared by tmux, so we time out the input wait and periodically
+    // resend the most recent frame to restore it. The interval is VECVIEW_REDRAW_MS (default
+    // 1000ms, minimum 100ms).
     let refresh = if backend.wants_periodic_redraw() {
         Some(Duration::from_millis(redraw_interval_ms()))
     } else {
         None
     };
 
-    // 画像転送のレート制限。キー長押し（ズーム/パン/キャレット）で毎フレーム大きな画像を
-    // 端末へ流すと、生成側が消費側（特に tmux 経由の端末）を追い越して入力バッファが溢れ、
-    // 端末ごとクラッシュする。連続入力中は最大 1/MIN_FRAME に間引き、入力が止んだら最終状態を
-    // 1回描く（デバウンス）。間隔は VECVIEW_MIN_FRAME_MS（既定 80ms ≒ 12fps、最小 16ms）。
-    // tmux passthrough 経由（placeholder / sixel）は転送が重く端末側に画像が溜まりやすいので
-    // 既定をより保守的に。直接配置はネイティブで軽いため小さめでよい。
+    // Rate-limit image transfer. Streaming a large image to the terminal every frame on a key
+    // hold (zoom/pan/caret) lets the producer outpace the consumer (especially terminals over
+    // tmux), overflowing the input buffer and crashing the terminal itself. During continuous
+    // input, throttle to at most 1/MIN_FRAME, and when input stops draw the final state once
+    // (debounce). The interval is VECVIEW_MIN_FRAME_MS (default 80ms ≈ 12fps, minimum 16ms).
+    // Over tmux passthrough (placeholder / sixel) transfer is heavy and images pile up on the
+    // terminal side, so be more conservative by default. Direct placement is native and light, so
+    // a smaller value is fine.
     let min_frame_default = if backend.name().contains("placeholder") || backend.name().contains("tmux") {
         200
     } else {
@@ -396,13 +416,14 @@ fn main() -> Result<()> {
     };
     let min_frame = Duration::from_millis(min_frame_ms(min_frame_default));
     let mut last_draw: Option<Instant> = None;
-    let mut pending_full = false; // フル再描画（GPU 再ラスタライズ）が保留中。
-    let mut pending_overlay = false; // overlay 軽量再描画が保留中。
-    let mut last_sixel = Instant::now(); // sixel 定期再描画の前回時刻。
+    let mut pending_full = false; // A full redraw (GPU re-rasterization) is pending.
+    let mut pending_overlay = false; // A lightweight overlay redraw is pending.
+    let mut last_sixel = Instant::now(); // Previous time of the periodic sixel redraw.
 
-    // tmux placeholder kitty は別ウィンドウへ切り替えると、端末が画像を tmux のウィンドウ単位で
-    // クリップしないため、画像が前面ウィンドウのペインに残ってしまう。自ウィンドウが可視かを
-    // 定期ポーリングし、隠れたら画像を消し、戻ったら再描画する。$TMUX_PANE の window_active で判定。
+    // With tmux placeholder kitty, switching to another window leaves the image stuck in the
+    // foreground window's pane, because the terminal doesn't clip images per tmux window. Poll
+    // periodically whether our own window is visible; clear the image when hidden and redraw when
+    // it returns. Visibility is judged via $TMUX_PANE's window_active.
     let kitty_ph = backend.name().contains("placeholder");
     let vis_pane = std::env::var("TMUX_PANE").ok();
     let vis_poll = Duration::from_millis(250);
@@ -410,7 +431,8 @@ fn main() -> Result<()> {
     let mut was_visible = true;
 
     loop {
-        // 次の入力待ち時間：sixel 定期再描画・可視ポーリング・間引き中の保留描画の締切のうち最短。
+        // Next input-wait duration: the shortest of the periodic sixel redraw, visibility polling,
+        // and the deadline of a pending draw that's being throttled.
         let wait = {
             let mut w = refresh;
             if pending_full || pending_overlay {
@@ -426,7 +448,8 @@ fn main() -> Result<()> {
             w
         };
 
-        // 入力を受信（待ち時間ありならタイムアウト）。タイムアウト時は msgs 空で描画判定へ進む。
+        // Receive input (with a timeout if there's a wait duration). On timeout, proceed to the
+        // draw decision with msgs empty.
         let msgs: Vec<Msg> = match wait {
             Some(d) => match rx.recv_timeout(d) {
                 Ok(first) => drain_burst(first, &rx),
@@ -441,9 +464,9 @@ fn main() -> Result<()> {
 
         let mut quit = false;
         let mut reload = false;
-        let mut dirty = false; // キー操作などで通常表示のフル再描画（GPU 再ラスタライズ）が必要。
-        let mut overlay_only = false; // copy mode のキャレット/選択のみ変化＝ベース画像を使い回す軽量再描画。
-        let mut help_changed = false; // ヘルプの表示/非表示が切り替わった。
+        let mut dirty = false; // A key action etc. requires a full redraw (GPU re-rasterization) of the normal display.
+        let mut overlay_only = false; // Only the copy-mode caret/selection changed = lightweight redraw reusing the base image.
+        let mut help_changed = false; // Help visibility was toggled.
 
         let pages = current_page_count(&source, pdf_doc.as_ref());
         for m in msgs {
@@ -456,7 +479,7 @@ fn main() -> Result<()> {
                     if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                         continue;
                     }
-                    // copy mode 中はキーをそちらで消費する（通常ナビと衝突させない）。
+                    // While in copy mode, consume keys there (don't let them collide with normal navigation).
                     if let Some(mut cm) = state.copy.take() {
                         match handle_copy_key(&k, &mut cm) {
                             CopyOutcome::Yank => {
@@ -464,12 +487,12 @@ fn main() -> Result<()> {
                                 let n = text.chars().count();
                                 copy_to_clipboard(&text);
                                 state.status = Some(format!("copied {n} chars"));
-                                overlay_only = true; // cm は戻さない＝抜ける。view 不変なので軽量再描画。
+                                overlay_only = true; // Don't put cm back = exit. View is unchanged, so lightweight redraw.
                             }
                             CopyOutcome::Exit => overlay_only = true,
                             CopyOutcome::Redraw => {
                                 state.copy = Some(cm);
-                                overlay_only = true; // キャレット/選択のみ変化＝ GPU 再描画しない。
+                                overlay_only = true; // Only caret/selection changed = no GPU redraw.
                             }
                             CopyOutcome::Ignore => state.copy = Some(cm),
                         }
@@ -484,7 +507,7 @@ fn main() -> Result<()> {
                             state.help = !state.help;
                             help_changed = true;
                         }
-                        // ヘルプ表示中はどのキーでも閉じる（その操作は消費する）。
+                        // While help is shown, any key closes it (and that keypress is consumed).
                         _ if state.help => {
                             state.help = false;
                             help_changed = true;
@@ -512,7 +535,7 @@ fn main() -> Result<()> {
                 }
                 Msg::Mouse(m) => {
                     match m.kind {
-                        // 押下: copy mode でなければテキスト層を作って入り、最寄り文字にアンカー。
+                        // Press: if not in copy mode, build the text layer, enter it, and anchor on the nearest character.
                         MouseEventKind::Down(MouseButton::Left) => {
                             if state.copy.is_none() {
                                 if let Ok(glyphs) = build_text_layer(
@@ -532,17 +555,17 @@ fn main() -> Result<()> {
                                 }
                             }
                         }
-                        // ドラッグ: キャレットを伸ばす（アンカーは保持）。
+                        // Drag: extend the caret (keep the anchor).
                         MouseEventKind::Drag(MouseButton::Left) => {
                             if let Some(idx) = mouse_to_glyph(&state, m.column, m.row) {
                                 if let Some(cm) = state.copy.as_mut() {
                                     cm.cursor = idx;
-                                    overlay_only = true; // 選択のみ変化＝軽量再描画。
+                                    overlay_only = true; // Only the selection changed = lightweight redraw.
                                 }
                             }
                         }
-                        // 離す: 実際にドラッグした（範囲がある）ならコピーして抜ける。
-                        // 単クリックはキャレットを置くだけで継続（その後キーボードで選択可）。
+                        // Release: if we actually dragged (there's a range), copy and exit.
+                        // A single click just places the caret and continues (then you can select with the keyboard).
                         MouseEventKind::Up(MouseButton::Left) => {
                             if let Some(cm) = state.copy.take() {
                                 let drag = matches!(cm.anchor, Some(a) if a != cm.cursor);
@@ -554,11 +577,11 @@ fn main() -> Result<()> {
                                 } else {
                                     state.copy = Some(cm);
                                 }
-                                overlay_only = true; // view 不変＝軽量再描画。
+                                overlay_only = true; // View unchanged = lightweight redraw.
                             }
                         }
-                        // ホイール: ページめくり（下=次ページ、上=前ページ）。実際にページが
-                        // 変わったときだけ再描画する。copy mode 中はグリフ座標が陳腐化するので抜ける。
+                        // Wheel: page turn (down = next page, up = previous page). Redraw only when
+                        // the page actually changes. In copy mode, glyph coordinates go stale, so exit.
                         MouseEventKind::ScrollDown => {
                             let prev = state.page;
                             apply_action(Action::NextPage, pages, &mut state);
@@ -582,15 +605,15 @@ fn main() -> Result<()> {
             }
         }
 
-        // Quit はバースト内の再変換・描画より優先（重い処理に入る前に抜ける）。
+        // Quit takes priority over re-conversion/drawing within the burst (exit before heavy work).
         if quit {
             break;
         }
 
         if reload {
             if let Source::Pdf { pdf } = &source {
-                // 元 PDF が変わったので開き直す（監視対象＝元 PDF、描画は pdfium がメモリ上の
-                // ドキュメントから行うので自己トリガーは起きない）。
+                // The source PDF changed, so reopen it (the watched target is the source PDF, and
+                // drawing reads from the in-memory document via pdfium, so no self-trigger occurs).
                 match vecview_pdf::Pdf::open(pdf) {
                     Ok(doc) => {
                         let pc = doc.page_count();
@@ -601,23 +624,25 @@ fn main() -> Result<()> {
                         }
                         dirty = true;
                     }
-                    // 書き込み途中の PDF を開くと一時的に失敗する。次の Reload で取り直す。
-                    Err(e) => eprintln!("vecview: PDF 再オープンエラー: {e:#}"),
+                    // Opening a PDF mid-write fails temporarily. Retry on the next Reload.
+                    Err(e) => eprintln!("vecview: PDF reopen error: {e:#}"),
                 }
             } else {
-                // コンパイル完了後（debounce 済み）なので、版縮小で取り残された古い末尾ページを
-                // ここで安全に削除する（書き込み途中ではないため現行ページは消さない）。
+                // We're past compilation (debounced), so it's safe here to delete old trailing
+                // pages left behind when the edition shrank (we're not mid-write, so current pages
+                // aren't deleted).
                 if let Source::Typst { dir, stem, tag } = &source {
                     prune_stale_typst_pages(dir, stem, *tag);
                 }
-                // 版が縮んでページ番号が現行ページ数を超えていたらクランプ（PDF 側と同様）。
+                // If the edition shrank and the page number exceeds the current count, clamp it
+                // (same as on the PDF side).
                 let pc = current_page_count(&source, pdf_doc.as_ref());
                 if state.page >= pc {
                     state.page = pc - 1;
                     state.center = None;
                 }
-                // SVG/Typst は描画が atime を変えて notify が再発火する（自己トリガー）。
-                // 同一ページで mtime 不変なら描画しない。
+                // For SVG/Typst, drawing changes the atime and re-fires notify (self-trigger).
+                // Skip drawing if the page is unchanged and the mtime is the same.
                 let path = source.page_path(state.page);
                 let current = mtime_of(&path);
                 let unchanged = current.is_none()
@@ -627,36 +652,38 @@ fn main() -> Result<()> {
                     dirty = true;
                 }
             }
-            // 再読込で内容が変わったら copy mode のグリフ座標が陳腐化するので抜ける。
+            // If a reload changed the content, copy-mode glyph coordinates go stale, so exit.
             if dirty {
                 state.copy = None;
             }
         }
 
-        // 今イテレーションで必要になった描画を保留フラグへ畳み込む（実描画はレート制限つきで後段）。
+        // Fold the draws needed this iteration into pending flags (actual drawing happens later,
+        // rate-limited).
         if dirty {
             pending_full = true;
         }
         if overlay_only {
             pending_overlay = true;
         }
-        // ヘルプを閉じた直後は画像を描き直す必要がある。
+        // Right after closing help, the image needs to be redrawn.
         if help_changed && !state.help {
             pending_full = true;
         }
 
-        // 描画判定。ヘルプ表示中は画像描画を抑止し（点滅防止。閉じれば最新が出る）、
-        // 画像描画は min_frame で間引いて端末を追い越さないようにする（フラッド＝クラッシュ防止）。
+        // Draw decision. While help is shown, suppress image drawing (to prevent flicker; the
+        // latest appears once it's closed), and throttle image drawing by min_frame so we don't
+        // outpace the terminal (flood = crash prevention).
         if state.help {
             if help_changed {
                 draw_help(backend.as_ref(), &keymap);
             }
-            // 表示中は溜めない（閉じた時に help_changed で再セットされる）。
+            // Don't accumulate while shown (it's re-set via help_changed when closed).
             pending_full = false;
             pending_overlay = false;
         } else if (pending_full || pending_overlay) && (!kitty_ph || was_visible) {
-            // 自ウィンドウが隠れている間は描かない（前面ウィンドウへ画像が残るのを防ぐ）。
-            // 保留は残し、戻って可視になったときに描く。
+            // Don't draw while our own window is hidden (prevents the image lingering on the
+            // foreground window). Keep the pending flags and draw once it becomes visible again.
             let now = Instant::now();
             let can_draw = last_draw.is_none_or(|t| now.duration_since(t) >= min_frame);
             if can_draw {
@@ -671,7 +698,7 @@ fn main() -> Result<()> {
                         &mut base_frame,
                     );
                 } else if !redraw_overlay(backend.as_ref(), &state, &base_frame) {
-                    // copy mode の軽量再描画。キャッシュが無ければフル描画にフォールバック。
+                    // Lightweight copy-mode redraw. If there's no cache, fall back to a full draw.
                     render_current(
                         &source,
                         pdf_doc.as_ref(),
@@ -682,16 +709,17 @@ fn main() -> Result<()> {
                         &mut base_frame,
                     );
                 }
-                // copy mode のステータス/操作ヒントを最下行に出す。
+                // Print the copy-mode status / control hint on the bottom line.
                 draw_overlay_text(backend.as_ref(), &mut state);
                 last_draw = Some(now);
                 pending_full = false;
                 pending_overlay = false;
             }
-            // can_draw でなければ保留のまま。wait が締切で起こすので次イテレーションで描く。
+            // If not can_draw, leave it pending. The wait deadline will wake us, so it's drawn next iteration.
         }
 
-        // sixel 定期再描画（tmux に消された画像の復元）。描画レートとは独立に refresh 間隔で。
+        // Periodic sixel redraw (restoring an image cleared by tmux). At the refresh interval,
+        // independent of the draw rate.
         if let Some(r) = refresh {
             let now = Instant::now();
             if !state.help && now.duration_since(last_sixel) >= r {
@@ -700,7 +728,8 @@ fn main() -> Result<()> {
             }
         }
 
-        // 可視ポーリング（tmux placeholder のウィンドウ間残留対策）。隠れたら画像を消し、戻ったら再描画。
+        // Visibility polling (countering cross-window lingering of tmux placeholder). Clear the
+        // image when hidden, redraw when it returns.
         if kitty_ph {
             if let Some(pane) = vis_pane.as_deref() {
                 let now = Instant::now();
@@ -708,11 +737,11 @@ fn main() -> Result<()> {
                     last_vis_poll = now;
                     if let Some(visible) = pane_window_active(pane) {
                         if !visible && was_visible {
-                            // 別ウィンドウへ切替：転送済み画像を消して前面への残留を止める。
+                            // Switched to another window: clear the transferred image to stop it lingering in the foreground.
                             let _ = backend.clear();
                             was_visible = false;
                         } else if visible && !was_visible {
-                            // 戻ってきた：再描画して画像を復元する。
+                            // Returned: redraw to restore the image.
                             was_visible = true;
                             pending_full = true;
                         }
@@ -722,7 +751,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // 後始末：マウスキャプチャ無効化 + raw mode 解除 + 端末復帰 + typst 子プロセス停止。
+    // Cleanup: disable mouse capture + leave raw mode + restore the terminal + stop the typst child process.
     if interactive {
         crossterm::execute!(std::io::stdout(), DisableMouseCapture).ok();
         crossterm::terminal::disable_raw_mode().ok();
@@ -732,37 +761,40 @@ fn main() -> Result<()> {
         let _ = child.kill();
         let _ = child.wait();
     }
-    // 自インスタンスが /tmp に出した一時ファイルを掃除（PID 付きなので他インスタンスは無傷）。
+    // Clean up the temp files this instance wrote to /tmp (PID-tagged, so other instances are untouched).
     source.cleanup();
 
     Ok(())
 }
 
-/// 現在の表示状態。zoom はフィット倍率に対する%。center はビューポート中心（ページ座標、
-/// None ならページ中央）。last_vw/vh は直近のビューポート寸法（パン量の基準）。
+/// Current display state. `zoom` is a % relative to the fit factor. `center` is the viewport
+/// center (page coordinates; None means page center). `last_vw`/`vh` are the most recent viewport
+/// dimensions (the basis for pan amounts).
 struct ViewState {
     page: usize,
     zoom: u32,
     center: Option<(f32, f32)>,
     last_vw: f32,
     last_vh: f32,
-    /// スーパーサンプリング倍率（1..=4）。描画解像度に掛かる。
+    /// Supersampling factor (1..=4). Multiplies the render resolution.
     scale: u32,
-    /// 次回描画時に本文境界へフィットさせる要求（描画時に本文 bbox を見て zoom/center へ反映）。
+    /// Request to fit to the content boundary on the next draw (at draw time, the content bbox is
+    /// consulted and reflected into zoom/center).
     pending_fit: Option<Fit>,
-    /// ヘルプ（ショートカット一覧）を表示中か。
+    /// Whether help (the shortcut list) is being shown.
     help: bool,
-    /// テキスト選択（copy mode）。None なら通常表示。
+    /// Text selection (copy mode). None means normal display.
     copy: Option<CopyMode>,
-    /// 直近に描画したページ内ビューポート [x, y, w, h]。マウス座標→ページ座標の逆変換に使う。
+    /// The most recently drawn in-page viewport [x, y, w, h]. Used to inverse-map mouse coords to page coords.
     last_viewport: Option<[f32; 4]>,
-    /// 直近のコピー結果メッセージ（ステータス行に1回だけ出す）。
+    /// The most recent copy-result message (printed once on the status line).
     status: Option<String>,
 }
 
-/// テキスト選択（copy mode）の状態。`glyphs` は現ページのテキスト層（読み順）、
-/// `lines` は可視行ごとのグリフ添字（各行は x 昇順）、`line_of` はグリフ→行番号。
-/// `cursor` はキャレット位置（グリフ添字）、`anchor` は選択開始（None なら未選択）。
+/// Text-selection (copy mode) state. `glyphs` is the current page's text layer (reading order),
+/// `lines` is the glyph indices per visible line (each line in ascending x), `line_of` maps glyph
+/// to line number. `cursor` is the caret position (glyph index), `anchor` is the selection start
+/// (None means no selection).
 struct CopyMode {
     glyphs: Vec<vecview_pdf::Glyph>,
     lines: Vec<Vec<usize>>,
@@ -772,16 +804,18 @@ struct CopyMode {
 }
 
 impl CopyMode {
-    /// テキスト層からグリフを可視行へグルーピングして copy mode を作る。glyphs が空なら None。
-    /// 制御文字（pdfium が行間に挟む `\r`/`\n` 等。矩形を持たない）は除外し、改行は行ジオメトリから
-    /// 再構成する（[`selected_text`] が行変化に `\n` を挿入）。空白は語間に必要なので残す。
+    /// Build a copy mode by grouping glyphs from the text layer into visible lines. None if glyphs
+    /// is empty. Control characters (e.g. `\r`/`\n` that pdfium inserts between lines; they have no
+    /// rect) are excluded, and line breaks are reconstructed from line geometry ([`selected_text`]
+    /// inserts `\n` on a line change). Whitespace is kept since it's needed between words.
     fn new(glyphs: Vec<vecview_pdf::Glyph>) -> Option<Self> {
         let glyphs: Vec<vecview_pdf::Glyph> =
             glyphs.into_iter().filter(|g| !g.ch.is_control()).collect();
         if glyphs.is_empty() {
             return None;
         }
-        // 読み順のまま、y中心が前行から半文字以上ずれたら改行とみなして行へ束ねる。
+        // In reading order, bundle into lines, treating it as a line break when the y center
+        // deviates from the previous line by more than half a character.
         let mut lines: Vec<Vec<usize>> = Vec::new();
         let mut line_of = vec![0usize; glyphs.len()];
         let mut cur_y = f32::NAN;
@@ -806,13 +840,13 @@ impl CopyMode {
         })
     }
 
-    /// グリフ中心 x。j/k の桁保持に使う。
+    /// Glyph center x. Used to preserve the column for j/k.
     fn center_x(&self, idx: usize) -> f32 {
         let r = self.glyphs[idx].rect;
         r[0] + r[2] / 2.0
     }
 
-    /// 上下の行へ、現在の x になるべく近いグリフへ移動する。
+    /// Move to the line above/below, to the glyph closest to the current x.
     fn move_line(&mut self, delta: i32) {
         let line = self.line_of[self.cursor];
         let target = line as i32 + delta;
@@ -833,7 +867,7 @@ impl CopyMode {
         }
     }
 
-    /// 現在行の先頭/末尾グリフ。
+    /// The first/last glyph of the current line.
     fn line_edge(&mut self, end: bool) {
         let line = &self.lines[self.line_of[self.cursor]];
         if let Some(&i) = if end { line.last() } else { line.first() } {
@@ -841,7 +875,7 @@ impl CopyMode {
         }
     }
 
-    /// 選択範囲 [start, end]（読み順, 両端含む）。未選択ならキャレット1文字。
+    /// The selection range [start, end] (reading order, both ends inclusive). If unselected, the single caret character.
     fn range(&self) -> (usize, usize) {
         match self.anchor {
             Some(a) => (a.min(self.cursor), a.max(self.cursor)),
@@ -849,7 +883,7 @@ impl CopyMode {
         }
     }
 
-    /// 選択テキスト。行が変わる箇所に改行を挿入して連結する。
+    /// The selected text. Concatenated, inserting a newline where the line changes.
     fn selected_text(&self) -> String {
         let (s, e) = self.range();
         let mut out = String::new();
@@ -867,43 +901,43 @@ impl CopyMode {
     }
 }
 
-/// 本文（ink）境界へのフィット方向。
+/// The fit direction toward the content (ink) boundary.
 #[derive(Clone, Copy)]
 enum Fit {
-    /// 本文の左右いっぱいに合わせる（横方向にフィット、縦ははみ出し可・パンで送る）。
+    /// Fit the full left-right extent of the content (fit horizontally; vertical may overflow and is reached by panning).
     Width,
-    /// 本文の上下いっぱいに合わせる（縦方向にフィット）。
+    /// Fit the full top-bottom extent of the content (fit vertically).
     Height,
 }
 
-/// キー操作。
+/// Key action.
 #[derive(Clone, Copy)]
 enum Action {
     Quit,
     ZoomIn,
     ZoomOut,
     ZoomReset,
-    /// ビューポートを (dx, dy) 方向に移動（符号のみ。量は last_vw/vh から算出）。
+    /// Move the viewport in the (dx, dy) direction (sign only; the amount is derived from last_vw/vh).
     Pan(f32, f32),
     NextPage,
     PrevPage,
     FirstPage,
     LastPage,
-    /// 本文境界へフィット（左右/上下）。
+    /// Fit to the content boundary (left-right / top-bottom).
     FitContent(Fit),
-    /// ショートカット一覧の表示/非表示を切り替える。
+    /// Toggle showing/hiding the shortcut list.
     ToggleHelp,
-    /// テキスト選択（copy mode）へ入る。
+    /// Enter text selection (copy mode).
     EnterCopyMode,
 }
 
-/// ズーム倍率（%）。最小はフィット(100)、最大は16倍。
+/// Zoom factor (%). The minimum is fit (100), the maximum is 16x.
 const ZOOM_MIN: u32 = 100;
 const ZOOM_MAX: u32 = 1600;
 
-/// 設定可能なアクションの一覧: (設定名, アクション, 既定キー)。設定名は config.toml の
-/// `[keys]` のキー、ヘルプ表示順もこの順。既定値:
-/// 拡大時の上下左右移動=矢印、ページ送り/戻り=j/k、先頭/最終ページ=h/l。
+/// The list of configurable actions: (config name, action, default keys). The config name is the
+/// key under `[keys]` in config.toml, and the help display order follows this order. Defaults:
+/// directional movement when zoomed = arrows, next/previous page = j/k, first/last page = h/l.
 const ACTIONS: &[(&str, Action, &[&str])] = &[
     ("zoom_in", Action::ZoomIn, &["+", "="]),
     ("zoom_out", Action::ZoomOut, &["-", "_"]),
@@ -923,20 +957,21 @@ const ACTIONS: &[(&str, Action, &[&str])] = &[
     ("quit", Action::Quit, &["q", "esc", "ctrl+c"]),
 ];
 
-/// キー（コード＋Ctrl 有無）→アクションの対応表と、ヘルプ表示用の有効バインドを保持する。
+/// Holds the key (code + whether Ctrl) -> action lookup table, plus the effective bindings for the
+/// help display.
 struct Keymap {
     lookup: std::collections::HashMap<(KeyCode, bool), Action>,
-    /// (設定名, 実際のキー文字列) を ACTIONS 順に。ヘルプ表示・設定リファレンス用。
+    /// (config name, actual key strings) in ACTIONS order. For the help display and config reference.
     help: Vec<(&'static str, Vec<String>)>,
 }
 
 impl Keymap {
-    /// 既定値＋設定ファイルの上書きからキーマップを構築する。
+    /// Build the keymap from defaults plus config-file overrides.
     fn load() -> Self {
         Self::build(&read_key_overrides())
     }
 
-    /// 既定値に `overrides`（設定名→キー文字列）を被せてキーマップを構築する。
+    /// Build the keymap by overlaying `overrides` (config name -> key strings) onto the defaults.
     fn build(overrides: &std::collections::HashMap<String, Vec<String>>) -> Self {
         let mut lookup = std::collections::HashMap::new();
         let mut help = Vec::new();
@@ -950,7 +985,7 @@ impl Keymap {
                     Some(key) => {
                         lookup.insert(key, *action);
                     }
-                    None => eprintln!("vecview: 不明なキー指定 {spec:?}（{name}）"),
+                    None => eprintln!("vecview: unknown key spec {spec:?} ({name})"),
                 }
             }
             help.push((*name, keys));
@@ -958,14 +993,14 @@ impl Keymap {
         Keymap { lookup, help }
     }
 
-    /// キーイベントに対応するアクションを返す。
+    /// Return the action corresponding to a key event.
     fn action(&self, k: &KeyEvent) -> Option<Action> {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         self.lookup.get(&(k.code, ctrl)).copied()
     }
 }
 
-/// 設定ファイル `[keys]` から「設定名→キー文字列の並び」を読む。存在/解析失敗時は空（既定のみ）。
+/// Read "config name -> sequence of key strings" from `[keys]` in the config file. Empty (defaults only) if it doesn't exist or fails to parse.
 fn read_key_overrides() -> std::collections::HashMap<String, Vec<String>> {
     let mut out = std::collections::HashMap::new();
     let Some(path) = config_path() else {
@@ -977,7 +1012,7 @@ fn read_key_overrides() -> std::collections::HashMap<String, Vec<String>> {
     let table = match text.parse::<toml::Table>() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("vecview: 設定ファイル解析エラー ({}): {e}", path.display());
+            eprintln!("vecview: config file parse error ({}): {e}", path.display());
             return out;
         }
     };
@@ -995,8 +1030,8 @@ fn read_key_overrides() -> std::collections::HashMap<String, Vec<String>> {
     out
 }
 
-/// 設定ファイルのパス。優先順位: 環境変数 VECVIEW_CONFIG > $XDG_CONFIG_HOME/vecview/config.toml
-/// > ~/.config/vecview/config.toml。
+/// The config file path. Precedence: VECVIEW_CONFIG environment variable >
+/// $XDG_CONFIG_HOME/vecview/config.toml > ~/.config/vecview/config.toml.
 fn config_path() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("VECVIEW_CONFIG") {
         return Some(PathBuf::from(p));
@@ -1007,8 +1042,8 @@ fn config_path() -> Option<PathBuf> {
     Some(base.join("vecview").join("config.toml"))
 }
 
-/// キー指定文字列を (KeyCode, Ctrl有無) に解析する。例: "q", "+", "left", "space", "ctrl+c"。
-/// 名前付きキーは大小無視、1文字キーは記号・大小をそのまま使う。
+/// Parse a key-spec string into (KeyCode, whether Ctrl). E.g. "q", "+", "left", "space", "ctrl+c".
+/// Named keys are case-insensitive; single-character keys use the symbol and case as-is.
 fn parse_key(spec: &str) -> Option<(KeyCode, bool)> {
     let spec = spec.trim();
     let (ctrl, rest) = match spec.strip_prefix("ctrl+").or_else(|| spec.strip_prefix("Ctrl+")) {
@@ -1031,7 +1066,7 @@ fn parse_key(spec: &str) -> Option<(KeyCode, bool)> {
         "home" => KeyCode::Home,
         "end" => KeyCode::End,
         _ => {
-            // 1文字キー（記号・英数字）。元の大小・記号をそのまま使う。
+            // Single-character key (symbol or alphanumeric). Use the original case/symbol as-is.
             let mut chars = rest.chars();
             let c = chars.next()?;
             if chars.next().is_some() {
@@ -1046,7 +1081,7 @@ fn parse_key(spec: &str) -> Option<(KeyCode, bool)> {
 fn apply_action(action: Action, pages: usize, state: &mut ViewState) {
     match action {
         Action::Quit => {}
-        // 乗算式（約1.5倍ずつ）。フィット(100%)が最小、それ以下は白地が広がるだけなので不可。
+        // Multiplicative (about 1.5x each step). Fit (100%) is the minimum; below that only widens the white background, so it's disallowed.
         Action::ZoomIn => state.zoom = (state.zoom * 3 / 2).clamp(ZOOM_MIN, ZOOM_MAX),
         Action::ZoomOut => state.zoom = (state.zoom * 2 / 3).clamp(ZOOM_MIN, ZOOM_MAX),
         Action::ZoomReset => {
@@ -1085,17 +1120,17 @@ fn apply_action(action: Action, pages: usize, state: &mut ViewState) {
                 state.center = None;
             }
         }
-        // 本文 bbox は描画時にしか分からない（ページを読む必要がある）ため、要求だけ立てておき、
-        // 描画時（render_pdf / render_and_display）に zoom/center へ反映する。
+        // The content bbox is only known at draw time (the page must be read), so just raise the
+        // request and reflect it into zoom/center at draw time (render_pdf / render_and_display).
         Action::FitContent(fit) => state.pending_fit = Some(fit),
-        // ヘルプ・copy mode はメインループ側で扱う（描画/入力経路が通常表示と異なるため）。
+        // Help and copy mode are handled in the main loop (their draw/input paths differ from normal display).
         Action::ToggleHelp => {}
         Action::EnterCopyMode => {}
     }
 }
 
-/// 現在のキーマップからショートカット一覧（ヘルプ表示）を生成する。設定名はそのまま
-/// config.toml の `[keys]` のキーになるので、設定リファレンスも兼ねる。
+/// Generate the shortcut list (help display) from the current keymap. The config names are exactly
+/// the keys under `[keys]` in config.toml, so this doubles as a config reference.
 fn help_lines(keymap: &Keymap) -> Vec<String> {
     let mut lines = vec![
         "vecview - keyboard shortcuts".to_string(),
@@ -1118,39 +1153,39 @@ fn help_lines(keymap: &Keymap) -> Vec<String> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "~/.config/vecview/config.toml".to_string());
     lines.push(format!("  config: {path}"));
-    lines.push("    [keys] に  <action> = [\"key\", ...]  で再割り当て可".to_string());
+    lines.push("    rebind under [keys] with  <action> = [\"key\", ...]".to_string());
     lines.push("  press any key to close".to_string());
     lines
 }
 
-/// ヘルプ画面を描く。画像を消してテキストを左上に並べる。
+/// Draw the help screen. Clear the image and lay out the text in the top-left.
 fn draw_help(backend: &dyn OutputBackend, keymap: &Keymap) {
     use std::io::Write;
     let _ = backend.clear();
     let mut out = std::io::stdout().lock();
     for (i, line) in help_lines(keymap).iter().enumerate() {
-        // 行頭（ペイン相対）へ移動して出力。raw mode のため明示的に桁も指定する。
+        // Move to the start of the line (pane-relative) and print. Specify the column explicitly too, since we're in raw mode.
         let _ = write!(out, "\x1b[{};3H{line}", i + 2);
     }
     let _ = out.flush();
 }
 
-/// copy mode のキー1打の結果。
+/// The result of a single keypress in copy mode.
 enum CopyOutcome {
-    /// 再描画する（カーソル/選択が動いた）。
+    /// Redraw (the cursor/selection moved).
     Redraw,
-    /// 選択をコピーして copy mode を抜ける。
+    /// Copy the selection and exit copy mode.
     Yank,
-    /// コピーせず copy mode を抜ける。
+    /// Exit copy mode without copying.
     Exit,
-    /// 何もしない（未割り当てキー）。
+    /// Do nothing (unassigned key).
     Ignore,
 }
 
-/// copy mode 中のキー処理。移動は vim/tmux 風（hjkl/矢印, 0/$, g/G）、space で選択開始、
-/// enter/y でヤンク、esc/q で取り消し。
+/// Key handling in copy mode. Movement is vim/tmux-style (hjkl/arrows, 0/$, g/G), space starts a
+/// selection, enter/y yanks, esc/q cancels.
 fn handle_copy_key(k: &KeyEvent, cm: &mut CopyMode) -> CopyOutcome {
-    // raw mode では Ctrl-C はキーイベントになる。copy mode に閉じ込めないよう抜ける。
+    // In raw mode, Ctrl-C arrives as a key event. Exit so we don't trap it inside copy mode.
     if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
         return CopyOutcome::Exit;
     }
@@ -1158,7 +1193,7 @@ fn handle_copy_key(k: &KeyEvent, cm: &mut CopyMode) -> CopyOutcome {
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => CopyOutcome::Exit,
         KeyCode::Enter | KeyCode::Char('y') => CopyOutcome::Yank,
-        // 選択開始/解除のトグル。
+        // Toggle starting/clearing the selection.
         KeyCode::Char(' ') | KeyCode::Char('v') => {
             cm.anchor = match cm.anchor {
                 Some(_) => None,
@@ -1202,8 +1237,9 @@ fn handle_copy_key(k: &KeyEvent, cm: &mut CopyMode) -> CopyOutcome {
     }
 }
 
-/// copy mode 突入時にテキスト層（読み順のグリフ）を作る。PDF は開いているドキュメント、
-/// Typst は表示用 SVG と pt 寸法が一致する PDF を一時生成して読む。単体 SVG はテキスト層なし。
+/// Build the text layer (glyphs in reading order) when entering copy mode. For PDF, the open
+/// document; for Typst, temporarily generate a PDF whose pt dimensions match the display SVG and
+/// read that. A standalone SVG has no text layer.
 fn build_text_layer(
     source: &Source,
     typ_path: &Path,
@@ -1212,12 +1248,13 @@ fn build_text_layer(
 ) -> Result<Vec<vecview_pdf::Glyph>> {
     match source {
         Source::Pdf { .. } => {
-            let doc = pdf.ok_or_else(|| anyhow!("PDF が開かれていません"))?;
+            let doc = pdf.ok_or_else(|| anyhow!("PDF is not open"))?;
             doc.page_text(page)
         }
         Source::Typst { dir, stem, tag } => {
-            // Typst SVG はグリフをパス化していて文字を持たないため、同じ .typ を PDF にも
-            // コンパイルし、その文字＋座標を使う（pt 寸法は SVG と一致）。PID 付きで他インスタンスと衝突回避。
+            // Typst SVG outlines glyphs into paths and carries no characters, so compile the same
+            // .typ to PDF as well and use its characters + coordinates (pt dimensions match the
+            // SVG). PID-tagged to avoid collisions with other instances.
             let pdf_path = dir.join(format!("vecview-{stem}-{tag}-text.pdf"));
             let ok = Command::new("typst")
                 .arg("compile")
@@ -1228,17 +1265,19 @@ fn build_text_layer(
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
-                .context("typst compile（テキスト用 PDF）の起動に失敗")?
+                .context("failed to launch typst compile (text PDF)")?
                 .success();
             if !ok {
-                bail!("typst compile（テキスト用 PDF）が失敗しました");
+                bail!("typst compile (text PDF) failed");
             }
-            let doc = vecview_pdf::Pdf::open(&pdf_path).context("テキスト用 PDF を開けません")?;
+            let doc = vecview_pdf::Pdf::open(&pdf_path).context("cannot open text PDF")?;
             let mut glyphs = doc.page_text(page)?;
-            // 表示は SVG（usvg）で、usvg は SVG の pt 指定を 96dpi で px に正規化するため、表示・
-            // ビューポートは「pt × 96/72」の単位になる。一方グリフ矩形は PDF の pt のまま。両者の
-            // ページ寸法比で同じ単位へスケールしないと、選択ハイライトが下/右へ行くほどズレる。
-            // 比はレンダラが実際に使う SVG 寸法と PDF pt 寸法から直接取る（usvg の DPI に非依存）。
+            // Display uses SVG (usvg), and usvg normalizes the SVG's pt specifications to px at
+            // 96dpi, so the display and viewport are in "pt × 96/72" units. The glyph rects,
+            // however, are still in PDF pt. Unless both are scaled to the same unit by their page
+            // dimension ratio, the selection highlight drifts further off the lower/right it goes.
+            // Take the ratio directly from the SVG dimensions the renderer actually uses and the
+            // PDF pt dimensions (independent of usvg's DPI).
             if let Ok((pdf_w, pdf_h)) = doc.page_size(page) {
                 let svg_dims = source
                     .page_path(page)
@@ -1260,13 +1299,14 @@ fn build_text_layer(
             }
             Ok(glyphs)
         }
-        // 単体 SVG（Typst 由来含む）は <text> を持たないことが多く、テキスト層は作れない。
+        // A standalone SVG (including Typst-derived ones) often has no <text>, so no text layer can be built.
         Source::Svg(_) => Ok(Vec::new()),
     }
 }
 
-/// マウスのセル座標 (col,row) を最寄りグリフの添字へ変換する。直近のビューポートと端末セル数から
-/// ページ座標を推定し、中心距離が最小のグリフを返す。
+/// Convert a mouse cell coordinate (col,row) to the index of the nearest glyph. Estimate the page
+/// coordinate from the most recent viewport and the terminal cell count, and return the glyph with
+/// the smallest center distance.
 fn mouse_to_glyph(state: &ViewState, col: u16, row: u16) -> Option<usize> {
     let cm = state.copy.as_ref()?;
     let [vx, vy, vw, vh] = state.last_viewport?;
@@ -1274,7 +1314,7 @@ fn mouse_to_glyph(state: &ViewState, col: u16, row: u16) -> Option<usize> {
     if cols == 0 || rows == 0 {
         return None;
     }
-    // セル中心の割合 → ページ座標。画像はペイン全体（cols×rows）を覆う前提。
+    // Cell-center fraction -> page coordinate. Assumes the image covers the whole pane (cols×rows).
     let px = vx + (col as f32 + 0.5) / cols as f32 * vw;
     let py = vy + (row as f32 + 0.5) / rows as f32 * vh;
     cm.glyphs
@@ -1284,15 +1324,15 @@ fn mouse_to_glyph(state: &ViewState, col: u16, row: u16) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-/// 点 (px,py) からグリフ矩形中心までの距離の2乗。
+/// The squared distance from point (px,py) to the center of a glyph rect.
 fn glyph_dist2(r: [f32; 4], px: f32, py: f32) -> f32 {
     let cx = r[0] + r[2] / 2.0;
     let cy = r[1] + r[3] / 2.0;
     (cx - px) * (cx - px) + (cy - py) * (cy - py)
 }
 
-/// 選択テキストを OSC 52 でクリップボードへ送る。tmux 内では passthrough でラップする。
-/// X11/Wayland 非依存・SSH 越しでもホスト側クリップボードに入る。
+/// Send the selected text to the clipboard via OSC 52. Inside tmux, wrap it in passthrough.
+/// Independent of X11/Wayland, and lands in the host-side clipboard even over SSH.
 fn copy_to_clipboard(text: &str) {
     use base64::Engine;
     use std::io::Write;
@@ -1300,7 +1340,7 @@ fn copy_to_clipboard(text: &str) {
     let seq = format!("\x1b]52;c;{b64}\x07");
     let mut out = std::io::stdout().lock();
     if std::env::var_os("TMUX").is_some() {
-        // tmux passthrough: 内側の ESC を二重化し \ePtmux;...\e\\ で包む。
+        // tmux passthrough: double the inner ESC and wrap in \ePtmux;...\e\\.
         let inner = seq.replace('\x1b', "\x1b\x1b");
         let _ = write!(out, "\x1bPtmux;{inner}\x1b\\");
     } else {
@@ -1309,8 +1349,8 @@ fn copy_to_clipboard(text: &str) {
     let _ = out.flush();
 }
 
-/// 選択ハイライトとキャレットを RGBA 画像へ直接ブレンドする。ページ座標→出力ピクセルは
-/// viewport の逆変換で求める。
+/// Blend the selection highlight and caret directly into the RGBA image. Page coords -> output
+/// pixels are obtained by the inverse transform of the viewport.
 fn overlay_selection(rgba: &mut [u8], out_w: u32, out_h: u32, viewport: [f32; 4], cm: &CopyMode) {
     let [vx, vy, vw, vh] = viewport;
     let sx = out_w as f32 / vw.max(1.0);
@@ -1321,7 +1361,7 @@ fn overlay_selection(rgba: &mut [u8], out_w: u32, out_h: u32, viewport: [f32; 4]
         for i in s..=e {
             let r = cm.glyphs[i].rect;
             if r[2] <= 0.0 || r[3] <= 0.0 {
-                continue; // 改行など矩形のない文字。
+                continue; // A character with no rect, such as a line break.
             }
             let x0 = (r[0] - vx) * sx;
             let y0 = (r[1] - vy) * sy;
@@ -1330,7 +1370,7 @@ fn overlay_selection(rgba: &mut [u8], out_w: u32, out_h: u32, viewport: [f32; 4]
             blend_rect(rgba, out_w, out_h, [x0, y0, x1, y1], [40, 120, 255], 0.38);
         }
     }
-    // キャレット（縦線）。
+    // Caret (vertical line).
     let cr = cm.glyphs[cm.cursor].rect;
     let cx = (cr[0] - vx) * sx;
     let cy0 = (cr[1] - vy) * sy;
@@ -1339,7 +1379,7 @@ fn overlay_selection(rgba: &mut [u8], out_w: u32, out_h: u32, viewport: [f32; 4]
     blend_rect(rgba, out_w, out_h, [cx, cy0, cx + cw, cy0 + ch], [255, 40, 40], 0.9);
 }
 
-/// 矩形 [x0,y0,x1,y1]（出力ピクセル）に `color` を係数 `a` でアルファブレンドする。
+/// Alpha-blend `color` into the rect [x0,y0,x1,y1] (output pixels) with coefficient `a`.
 fn blend_rect(rgba: &mut [u8], w: u32, h: u32, rect: [f32; 4], color: [u8; 3], a: f32) {
     let [x0, y0, x1, y1] = rect;
     let xa = x0.min(x1).floor().max(0.0) as u32;
@@ -1361,7 +1401,7 @@ fn blend_rect(rgba: &mut [u8], w: u32, h: u32, rect: [f32; 4], color: [u8; 3], a
     }
 }
 
-/// copy mode のステータス（直近のコピー結果）または操作ヒントを最下行に出す。
+/// Print the copy-mode status (the most recent copy result) or a control hint on the bottom line.
 fn draw_overlay_text(backend: &dyn OutputBackend, state: &mut ViewState) {
     use std::io::Write;
     let _ = backend;
@@ -1379,9 +1419,10 @@ fn draw_overlay_text(backend: &dyn OutputBackend, state: &mut ViewState) {
     }
 }
 
-/// copy mode のキャレット移動時に GPU 再ラスタライズを避けるためのベース画像キャッシュ
-/// （選択オーバーレイ適用前）。キーがすべて copy mode に消費され view が変わらない copy mode
-/// 中だけ使い回す。複雑な図を毎キー再描画すると GPU を酷使し端末ごと巻き込んで落ちうるため。
+/// Base-image cache (before the selection overlay) used to avoid GPU re-rasterization on caret
+/// moves in copy mode. Reused only while in copy mode, where all keys are consumed by copy mode
+/// and the view doesn't change. Redrawing a complex figure on every keypress would hammer the GPU
+/// and could take down the terminal with it.
 struct BaseFrame {
     out_w: u32,
     out_h: u32,
@@ -1389,9 +1430,9 @@ struct BaseFrame {
     rgba: Vec<u8>,
 }
 
-/// copy mode のキャレット/選択のみ変化したときの軽量再描画。直近のベース画像を使い回し、
-/// 選択オーバーレイだけ重ねて表示する（GPU 再描画・SVG 再読込なし）。キャッシュが無ければ
-/// false を返し、呼び出し側はフル描画にフォールバックする。
+/// Lightweight redraw when only the copy-mode caret/selection changed. Reuse the most recent base
+/// image and overlay just the selection (no GPU redraw, no SVG reload). Returns false if there's
+/// no cache, and the caller falls back to a full draw.
 fn redraw_overlay(backend: &dyn OutputBackend, state: &ViewState, base: &Option<BaseFrame>) -> bool {
     let Some(bf) = base else { return false };
     let mut rgba = bf.rgba.clone();
@@ -1401,8 +1442,8 @@ fn redraw_overlay(backend: &dyn OutputBackend, state: &ViewState, base: &Option<
     backend.display(&rgba, bf.out_w, bf.out_h).is_ok()
 }
 
-/// 現在ページを描画して表示する。PDF は pdfium、SVG/Typst は GPU レンダラー。
-/// 失敗（ファイル未生成等）時は静かにスキップ。
+/// Render and display the current page. PDF via pdfium, SVG/Typst via the GPU renderer.
+/// On failure (e.g. the file isn't generated yet), silently skip.
 fn render_current(
     source: &Source,
     pdf: Option<&vecview_pdf::Pdf>,
@@ -1416,7 +1457,7 @@ fn render_current(
         Source::Pdf { .. } => {
             let Some(doc) = pdf else { return };
             if let Err(e) = render_pdf(doc, backend, state, base) {
-                eprintln!("vecview: 描画エラー: {e:#}");
+                eprintln!("vecview: render error: {e:#}");
             }
         }
         _ => {
@@ -1427,13 +1468,13 @@ fn render_current(
             let Some(renderer) = renderer else { return };
             match render_and_display(&path, renderer, backend, state, base) {
                 Ok(()) => *last_render = mtime_of(&path).map(|m| (state.page, m)),
-                Err(e) => eprintln!("vecview: 描画エラー: {e:#}"),
+                Err(e) => eprintln!("vecview: render error: {e:#}"),
             }
         }
     }
 }
 
-/// PDF の現在ページを、ズーム/パン状態のビューポートで pdfium にラスタライズさせ表示する。
+/// Have pdfium rasterize the PDF's current page at the zoom/pan-state viewport and display it.
 fn render_pdf(
     pdf: &vecview_pdf::Pdf,
     backend: &dyn OutputBackend,
@@ -1443,10 +1484,12 @@ fn render_pdf(
     let (pw, ph) = pdf.page_size(state.page)?;
     let (pw, ph) = (pw.max(1.0), ph.max(1.0));
 
-    // 出力は常にペイン（表示領域）サイズ。ズームはビューポート矩形の大小で表現する。
+    // The output is always the pane (display area) size. Zoom is expressed by the size of the
+    // viewport rect.
     let (out_w, out_h) = available_area(backend.name(), state.scale);
 
-    // 本文フィット要求があれば、本文境界からズーム/中心を算出して通常のビューポート計算へ委譲。
+    // If there's a content-fit request, compute zoom/center from the content boundary and delegate
+    // to the normal viewport computation.
     if let Some(fit) = state.pending_fit.take() {
         if let Some(bbox) = pdf.content_bbox(state.page) {
             apply_fit(fit, bbox, pw, ph, out_w, out_h, state);
@@ -1461,11 +1504,13 @@ fn render_pdf(
     state.last_viewport = Some(viewport);
 
     let mut rgba = pdf.render(state.page, viewport, out_w, out_h)?;
-    // pdfium はビットマップ全体（ページ範囲外の letterbox 含む）を白の clear_color で塗るため、
-    // 縦長ページを横長ペインへフィットすると左右が白帯になり、ページの白と見分けがつかず「余分な
-    // 左右余白」に見える。SVG/Typst レンダラと同じ暗色でページ外を塗り直し、ページ境界を可視にする。
+    // pdfium fills the entire bitmap (including the letterbox outside the page) with the white
+    // clear_color, so fitting a tall page into a wide pane leaves white bands on the sides that are
+    // indistinguishable from the page's white and look like "extra left-right margin." Repaint
+    // outside the page with the same dark color as the SVG/Typst renderer to make the page
+    // boundary visible.
     fill_letterbox(&mut rgba, out_w, out_h, viewport, pw, ph);
-    // copy mode 中はオーバーレイ適用前のベースをキャッシュ（以降のキャレット移動で使い回す）。
+    // While in copy mode, cache the base before applying the overlay (reused across subsequent caret moves).
     if state.copy.is_some() {
         *base = Some(BaseFrame { out_w, out_h, viewport, rgba: rgba.clone() });
     }
@@ -1476,10 +1521,11 @@ fn render_pdf(
     Ok(())
 }
 
-/// ページ範囲外（letterbox）を暗色で塗る。pdfium はページ範囲外も clear_color の白で塗ってしまう
-/// ため、SVG レンダラ（`LETTERBOX` = 0.10 グレー相当）に合わせてページ境界を見えるようにする。
-/// ページ矩形 [0,0,pw,ph]（pt）をビューポート→出力ピクセルへ順変換し、その外側だけ塗り替える。
-/// 拡大中（ページが出力を覆う）は矩形が出力全体を含むので何もしない。
+/// Fill outside the page (the letterbox) with a dark color. Because pdfium paints even outside the
+/// page with the white clear_color, match the SVG renderer (`LETTERBOX` = 0.10 gray equivalent) to
+/// make the page boundary visible. Forward-transform the page rect [0,0,pw,ph] (pt) from viewport
+/// to output pixels and repaint only outside it. When zoomed in (the page covers the output), the
+/// rect contains the whole output, so this does nothing.
 fn fill_letterbox(rgba: &mut [u8], out_w: u32, out_h: u32, viewport: [f32; 4], pw: f32, ph: f32) {
     let [vx, vy, vw, vh] = viewport;
     let sx = out_w as f32 / vw.max(1.0);
@@ -1488,12 +1534,12 @@ fn fill_letterbox(rgba: &mut [u8], out_w: u32, out_h: u32, viewport: [f32; 4], p
     let y0 = ((0.0 - vy) * sy).round();
     let x1 = ((pw - vx) * sx).round();
     let y1 = ((ph - vy) * sy).round();
-    const C: u8 = 26; // LETTERBOX(0.10) を 8bit へ（0.10*255≒26）。
+    const C: u8 = 26; // LETTERBOX(0.10) to 8-bit (0.10*255 ≈ 26).
     for y in 0..out_h {
         let inside_y = (y as f32) >= y0 && (y as f32) < y1;
         for x in 0..out_w {
             if inside_y && (x as f32) >= x0 && (x as f32) < x1 {
-                continue; // ページ内はそのまま。
+                continue; // Inside the page: leave as-is.
             }
             let idx = ((y * out_w + x) * 4) as usize;
             rgba[idx] = C;
@@ -1504,13 +1550,14 @@ fn fill_letterbox(rgba: &mut [u8], out_w: u32, out_h: u32, viewport: [f32; 4], p
     }
 }
 
-/// ヘッドレス描画（`--render`）：端末も対話もなしで1ページを RGBA へ描き、PNG として出力する。
-/// 描画経路は対話モードと同じ（PDF=pdfium、SVG/Typst=wgpu）で、出力は `--size` の実ピクセル。
+/// Headless render (`--render`): draw one page to RGBA with no terminal and no interaction, and
+/// output it as PNG. The render path is the same as interactive mode (PDF=pdfium, SVG/Typst=wgpu),
+/// and the output is the actual pixels of `--size`.
 fn render_headless(args: &Args) -> Result<()> {
     let (out_w, out_h) = match args.size.as_deref() {
         Some(s) => parse_size(s)
-            .ok_or_else(|| anyhow!("--size の形式が不正です（例: 800x1000）: {s}"))?,
-        None => bail!("--render には --size が必要です（例: --size 800x1000）"),
+            .ok_or_else(|| anyhow!("invalid --size format (e.g. 800x1000): {s}"))?,
+        None => bail!("--render requires --size (e.g. --size 800x1000)"),
     };
     let output = args.output.as_deref().unwrap_or("-");
     let zoom = args.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
@@ -1525,21 +1572,21 @@ fn render_headless(args: &Args) -> Result<()> {
     let rgba = match ext.as_str() {
         "pdf" => render_pdf_headless(&args.file, page_idx, out_w, out_h, zoom)?,
         "svg" => {
-            let renderer = Renderer::new().context("レンダラー初期化")?;
+            let renderer = Renderer::new().context("renderer initialization")?;
             render_svg_file(&args.file, &renderer, out_w, out_h, zoom)?
         }
         "typ" => render_typ_headless(&args.file, page_idx, out_w, out_h, zoom)?,
-        other => bail!("未対応の拡張子です: .{other}（svg / typ / pdf のみ対応）"),
+        other => bail!("unsupported extension: .{other} (only svg / typ / pdf are supported)"),
     };
     write_png(&rgba, out_w, out_h, output)
 }
 
-/// ヘッドレスで PDF の1ページをビューポート（ページ中央・指定ズーム）でラスタライズする。
+/// Headlessly rasterize one page of a PDF at the viewport (page center, given zoom).
 fn render_pdf_headless(file: &Path, page: usize, out_w: u32, out_h: u32, zoom: u32) -> Result<Vec<u8>> {
-    let pdf = vecview_pdf::Pdf::open(file).context("PDF を開けません")?;
+    let pdf = vecview_pdf::Pdf::open(file).context("cannot open PDF")?;
     let pages = pdf.page_count();
     if page >= pages {
-        bail!("ページ範囲外: {}（総 {} ページ）", page + 1, pages);
+        bail!("page out of range: {} (of {} total pages)", page + 1, pages);
     }
     let (pw, ph) = pdf.page_size(page)?;
     let (pw, ph) = (pw.max(1.0), ph.max(1.0));
@@ -1549,11 +1596,12 @@ fn render_pdf_headless(file: &Path, page: usize, out_w: u32, out_h: u32, zoom: u
     Ok(rgba)
 }
 
-/// ヘッドレスで Typst を単発コンパイル（`typst compile`）して SVG を生成し、要求ページを描く。
-/// 出力は一時ディレクトリに `vv-render-<stem>-<pid>-{p}.svg` として作り、描画後に掃除する。
+/// Headlessly run a one-shot Typst compile (`typst compile`) to generate SVG and draw the
+/// requested page. The output is created in the temp directory as `vv-render-<stem>-<pid>-{p}.svg`
+/// and cleaned up after drawing.
 fn render_typ_headless(file: &Path, page: usize, out_w: u32, out_h: u32, zoom: u32) -> Result<Vec<u8>> {
     if which_typst().is_none() {
-        bail!("typst が PATH にありません。Typst の描画には typst が必要です。");
+        bail!("typst is not on PATH. Typst rendering requires typst.");
     }
     let dir = std::env::temp_dir();
     let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("vv");
@@ -1566,11 +1614,11 @@ fn render_typ_headless(file: &Path, page: usize, out_w: u32, out_h: u32, zoom: u
         .arg("--format")
         .arg("svg")
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit()) // コンパイルエラーは表示する。
+        .stderr(Stdio::inherit()) // Show compile errors.
         .status()
-        .context("typst compile の起動に失敗")?
+        .context("failed to launch typst compile")?
         .success();
-    // 自分が出した一時 SVG（全ページ分）を消す。
+    // Delete the temp SVGs we emitted (for all pages).
     let cleanup = || {
         let prefix = format!("vv-render-{stem}-{tag}-");
         if let Ok(rd) = std::fs::read_dir(&dir) {
@@ -1583,24 +1631,24 @@ fn render_typ_headless(file: &Path, page: usize, out_w: u32, out_h: u32, zoom: u
     };
     if !ok {
         cleanup();
-        bail!("typst compile が失敗しました");
+        bail!("typst compile failed");
     }
     let page_svg = dir.join(format!("vv-render-{stem}-{tag}-{}.svg", page + 1));
     if !page_svg.exists() {
         cleanup();
-        bail!("ページ範囲外、または SVG が生成されませんでした: ページ {}", page + 1);
+        bail!("page out of range, or SVG was not generated: page {}", page + 1);
     }
-    let renderer = Renderer::new().context("レンダラー初期化")?;
+    let renderer = Renderer::new().context("renderer initialization")?;
     let res = render_svg_file(&page_svg, &renderer, out_w, out_h, zoom);
     cleanup();
     res
 }
 
-/// SVG ファイルを開き、ページ中央・指定ズームのビューポートで RGBA へ描く（ヘッドレス共通）。
+/// Open an SVG file and draw it to RGBA at the page-center, given-zoom viewport (shared by headless).
 fn render_svg_file(path: &Path, renderer: &Renderer, out_w: u32, out_h: u32, zoom: u32) -> Result<Vec<u8>> {
     let doc = SvgDocument::open(
         path.to_str()
-            .ok_or_else(|| anyhow!("パスが UTF-8 でありません"))?,
+            .ok_or_else(|| anyhow!("path is not UTF-8"))?,
     )?;
     let page = doc.render_page(0)?;
     let pw = page.width.max(1.0);
@@ -1609,7 +1657,7 @@ fn render_svg_file(path: &Path, renderer: &Renderer, out_w: u32, out_h: u32, zoo
     renderer.render(&page, out_w, out_h, viewport)
 }
 
-/// RGBA8（out_w×out_h）を PNG として `output` へ書く。`output` が `-` なら stdout。
+/// Write RGBA8 (out_w×out_h) as PNG to `output`. If `output` is `-`, write to stdout.
 fn write_png(rgba: &[u8], w: u32, h: u32, output: &str) -> Result<()> {
     use image::codecs::png::PngEncoder;
     use image::{ExtendedColorType, ImageEncoder};
@@ -1617,7 +1665,7 @@ fn write_png(rgba: &[u8], w: u32, h: u32, output: &str) -> Result<()> {
     let encode = |writer: &mut dyn std::io::Write| -> Result<()> {
         PngEncoder::new(writer)
             .write_image(rgba, w, h, ExtendedColorType::Rgba8)
-            .map_err(|e| anyhow!("PNG エンコード失敗: {e}"))
+            .map_err(|e| anyhow!("PNG encode failed: {e}"))
     };
     if output == "-" {
         let mut out = std::io::stdout().lock();
@@ -1625,7 +1673,7 @@ fn write_png(rgba: &[u8], w: u32, h: u32, output: &str) -> Result<()> {
         out.flush()?;
     } else {
         let f = std::fs::File::create(output)
-            .with_context(|| format!("出力ファイルを作成できません: {output}"))?;
+            .with_context(|| format!("cannot create output file: {output}"))?;
         let mut w = std::io::BufWriter::new(f);
         encode(&mut w)?;
         w.flush()?;
@@ -1633,7 +1681,7 @@ fn write_png(rgba: &[u8], w: u32, h: u32, output: &str) -> Result<()> {
     Ok(())
 }
 
-/// `"幅x高"`（区切りは `x`/`X`）を (幅, 高) ピクセルへ解析する。0 は不可、上限 16384 にクランプ。
+/// Parse `"WxH"` (separator `x`/`X`) into (width, height) pixels. 0 is disallowed; clamp the upper bound to 16384.
 fn parse_size(s: &str) -> Option<(u32, u32)> {
     let (w, h) = s.trim().split_once(['x', 'X'])?;
     let w: u32 = w.trim().parse().ok()?;
@@ -1644,10 +1692,10 @@ fn parse_size(s: &str) -> Option<(u32, u32)> {
     Some((w.min(16384), h.min(16384)))
 }
 
-/// `dir` 内の `vecview-<stem>-<pid>-…` のうち、`<pid>` のプロセスがもう生きていないもの（＝過去に
-/// クラッシュ等で掃除されずに残ったファイル）を削除する。稼働中の他インスタンスのファイルは
-/// PID が生きているので消さない。プロセス生存判定は Linux の /proc を使い、それ以外の OS では何もしない
-/// （`/tmp` の再起動クリアに任せる）。
+/// Among `vecview-<stem>-<pid>-…` files in `dir`, delete those whose `<pid>` process is no longer
+/// alive (i.e. files left behind without cleanup after a past crash, etc.). Files of other running
+/// instances are kept since their PID is alive. Process-liveness uses Linux's /proc; on other OSes
+/// it does nothing (leaving it to `/tmp` being cleared on reboot).
 fn sweep_dead_typst_pages(dir: &Path, stem: &str) {
     let prefix = format!("vecview-{stem}-");
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -1657,7 +1705,7 @@ fn sweep_dead_typst_pages(dir: &Path, stem: &str) {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        // "vecview-<stem>-" を剥がし、続く数字列（PID）を取り出す。
+        // Strip "vecview-<stem>-" and extract the following digit string (the PID).
         let Some(rest) = name.strip_prefix(&prefix) else {
             continue;
         };
@@ -1671,8 +1719,8 @@ fn sweep_dead_typst_pages(dir: &Path, stem: &str) {
     }
 }
 
-/// PID のプロセスが生存しているか。Linux は `/proc/<pid>` の有無で判定。他 OS は常に true を返し
-/// （安全側＝消さない）、掃除を行わない。
+/// Whether the PID's process is alive. On Linux, judge by the presence of `/proc/<pid>`. On other
+/// OSes, always return true (the safe side = don't delete) and perform no cleanup.
 fn process_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -1685,10 +1733,10 @@ fn process_alive(pid: u32) -> bool {
     }
 }
 
-/// `typst watch <file> <tmp>-{p}.svg` を起動し、(Source, 子プロセス) を返す。
+/// Launch `typst watch <file> <tmp>-{p}.svg` and return (Source, child process).
 fn spawn_typst_watch(typ: &Path) -> Result<(Source, Child)> {
     if which_typst().is_none() {
-        bail!("typst が PATH にありません。Typst プレビューには typst が必要です。");
+        bail!("typst is not on PATH. Typst preview requires typst.");
     }
     let stem = typ
         .file_stem()
@@ -1696,12 +1744,14 @@ fn spawn_typst_watch(typ: &Path) -> Result<(Source, Child)> {
         .unwrap_or("vecview")
         .to_string();
     let dir = std::env::temp_dir();
-    // 出力パスはプロセス固有（PID）。同じ文書を複数インスタンスで開いてもファイルが衝突しない。
+    // The output path is process-specific (PID). Files don't collide even when the same document
+    // is opened in multiple instances.
     let tag = std::process::id();
-    // 過去にクラッシュ等で残った（プロセスが死んでいる）同名文書の取り残しだけ掃除する。
-    // 稼働中の他インスタンスのファイルは PID が生きているので消さない。監視開始前なので通知は出ない。
+    // Clean up only leftovers from same-named documents whose process is dead (left behind after a
+    // past crash, etc.). Files of other running instances are kept since their PID is alive. This
+    // runs before watching starts, so no notification fires.
     sweep_dead_typst_pages(&dir, &stem);
-    // 複数ページ文書でも typst がエラーにならないようページ番号テンプレート {p} を使う。
+    // Use the page-number template {p} so typst doesn't error on multi-page documents.
     let template = dir.join(format!("vecview-{stem}-{tag}-{{p}}.svg"));
 
     let child = Command::new("typst")
@@ -1711,9 +1761,9 @@ fn spawn_typst_watch(typ: &Path) -> Result<(Source, Child)> {
         .arg("--format")
         .arg("svg")
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit()) // typst のコンパイルエラーを表示。
+        .stderr(Stdio::inherit()) // Show typst's compile errors.
         .spawn()
-        .context("typst watch の起動に失敗")?;
+        .context("failed to launch typst watch")?;
 
     Ok((Source::Typst { dir, stem, tag }, child))
 }
@@ -1730,7 +1780,7 @@ fn which_typst() -> Option<PathBuf> {
     })
 }
 
-/// SVG を読み込み、現在のズーム/パン状態に応じたビューポートを描画して表示する。
+/// Load the SVG and render/display the viewport for the current zoom/pan state.
 fn render_and_display(
     svg_path: &Path,
     renderer: &Renderer,
@@ -1741,33 +1791,35 @@ fn render_and_display(
     let doc = SvgDocument::open(
         svg_path
             .to_str()
-            .ok_or_else(|| anyhow!("パスが UTF-8 でありません"))?,
+            .ok_or_else(|| anyhow!("path is not UTF-8"))?,
     )?;
     let page = doc.render_page(0)?;
     let pw = page.width.max(1.0);
     let ph = page.height.max(1.0);
 
-    // 出力は常にペイン（表示領域）サイズ。ズームはビューポート矩形の大小で表現する。
+    // The output is always the pane (display area) size. Zoom is expressed by the size of the
+    // viewport rect.
     let (out_w, out_h) = available_area(backend.name(), state.scale);
 
-    // 本文フィット要求があれば、本文境界からズーム/中心を算出して通常のビューポート計算へ委譲。
+    // If there's a content-fit request, compute zoom/center from the content boundary and delegate
+    // to the normal viewport computation.
     if let Some(fit) = state.pending_fit.take() {
         if let Some(bbox) = content_bbox(&page) {
             apply_fit(fit, bbox, pw, ph, out_w, out_h, state);
         }
     }
 
-    // 中心（未設定ならページ中央）からビューポートを計算（内部でページ内にクランプ）。
+    // Compute the viewport from the center (page center if unset) (clamped within the page internally).
     let center = state.center.unwrap_or((pw / 2.0, ph / 2.0));
     let viewport = viewport_for(pw, ph, out_w, out_h, state.zoom, center);
     state.last_vw = viewport[2];
     state.last_vh = viewport[3];
-    // クランプ後のビューポート中心を保存し、以降のパンが端で破綻しないようにする。
+    // Save the clamped viewport center so subsequent panning doesn't break at the edges.
     state.center = Some((viewport[0] + viewport[2] / 2.0, viewport[1] + viewport[3] / 2.0));
     state.last_viewport = Some(viewport);
 
     let mut rgba = renderer.render(&page, out_w, out_h, viewport)?;
-    // copy mode 中はオーバーレイ適用前のベースをキャッシュ（以降のキャレット移動で使い回す）。
+    // While in copy mode, cache the base before applying the overlay (reused across subsequent caret moves).
     if state.copy.is_some() {
         *base = Some(BaseFrame { out_w, out_h, viewport, rgba: rgba.clone() });
     }
@@ -1778,38 +1830,43 @@ fn render_and_display(
     Ok(())
 }
 
-/// ラスタ化する解像度（ピクセル）を求める。
+/// Determine the resolution (pixels) to rasterize at.
 ///
-/// tmux プレースホルダ配置では端末がピクセル寸法を報告せず（width/height=0）、セル数 ×
-/// 概算セルサイズ(8x16) に頼るしかない。実セルサイズが概算より大きい環境（HiDPI 等）では
-/// この低解像度のまま端末側で引き伸ばされてボケる。そこでプレースホルダ時のみ高解像度で
-/// ラスタ化し、端末側の縮小でシャープにする（スーパーサンプリング）。倍率は VECVIEW_SCALE
-/// （`scale`、既定1=等倍、1..=4）。高倍率は転送量が倍率²で増え連続操作で端末が落ちうるため既定は
-/// 等倍。直接配置(a=T)やフレームバッファはネイティブ画素表示なので常に等倍に保つ。
+/// With tmux placeholder placement, the terminal doesn't report pixel dimensions (width/height=0),
+/// leaving no choice but to rely on cell count × an estimated cell size (8x16). In environments
+/// where the actual cell size is larger than the estimate (HiDPI, etc.), this stays low-resolution
+/// and gets stretched and blurred on the terminal side. So, only for placeholder, rasterize at
+/// higher resolution and let the terminal's downscaling sharpen it (supersampling). The factor is
+/// VECVIEW_SCALE (`scale`, default 1=native, 1..=4). A high factor grows transfer size with the
+/// square of the factor and can crash the terminal under continuous operation, so the default is
+/// native. Direct placement (a=T) and the framebuffer display native pixels, so always keep them
+/// at native scale.
 fn available_area(backend_name: &str, scale: u32) -> (u32, u32) {
     if backend_name.starts_with("framebuffer") {
         if let Some(sz) = read_fb_virtual_size() {
             return sz;
         }
     }
-    // 画像が cols×rows セルへ縮小配置されるプレースホルダ時のみ過剰描画してよい。
+    // Over-render only for placeholder, where the image is downscaled into cols×rows cells.
     let ss = if backend_name.contains("placeholder") {
         scale
     } else {
         1
     };
-    // 端末のピクセルサイズ（取得できなければセル数から概算、最後は固定値）。
-    // 概算セルサイズは VECVIEW_CELL_PX=幅x高 で上書き可能。SSH+tmux 等ではピクセル寸法が
-    // 伝播せず（width/height=0）、実セルサイズが概算とズレて Sixel が縮小表示されるため、
-    // 環境ごとに 1 度合わせれば以後ペインを正しく埋められる。
+    // The terminal's pixel size (estimated from cell count if unavailable, with a fixed value as a
+    // last resort). The estimated cell size can be overridden with VECVIEW_CELL_PX=WxH. Over
+    // SSH+tmux etc., pixel dimensions don't propagate (width/height=0) and the actual cell size
+    // differs from the estimate, so Sixel displays shrunken; tuning it once per environment lets
+    // the pane be filled correctly thereafter.
     let (cell_w, cell_h) = fallback_cell_px();
     if let Ok(ws) = crossterm::terminal::window_size() {
         if ws.width > 0 && ws.height > 0 {
             return (ws.width as u32, ws.height as u32);
         }
         if ws.columns > 0 && ws.rows > 0 {
-            // tmux passthrough sixel は画像がペイン下端（=物理画面下端）に達すると画面全体が
-            // スクロールし、隣ペインまで崩れる。最下 1 行ぶん空けて下端に届かないようにする。
+            // With tmux passthrough sixel, when the image reaches the bottom of the pane (= the
+            // bottom of the physical screen), the whole screen scrolls and even neighboring panes
+            // break. Leave the bottom 1 row free so it doesn't reach the bottom edge.
             let rows = if backend_name.contains("passthrough") {
                 (ws.rows as u32).saturating_sub(1).max(1)
             } else {
@@ -1821,8 +1878,9 @@ fn available_area(backend_name: &str, scale: u32) -> (u32, u32) {
     (1280 * ss, 800 * ss)
 }
 
-/// ピクセル寸法を報告しない端末向けの概算セルサイズ（幅, 高）。既定 8×16。
-/// 環境変数 `VECVIEW_CELL_PX="幅x高"`（例 `10x17`）で上書きできる。各値は 1..=128 にクランプ。
+/// Estimated cell size (width, height) for terminals that don't report pixel dimensions. Default
+/// 8×16. Can be overridden with the `VECVIEW_CELL_PX="WxH"` environment variable (e.g. `10x17`).
+/// Each value is clamped to 1..=128.
 fn fallback_cell_px() -> (u32, u32) {
     std::env::var("VECVIEW_CELL_PX")
         .ok()
@@ -1830,8 +1888,9 @@ fn fallback_cell_px() -> (u32, u32) {
         .unwrap_or((8, 16))
 }
 
-/// 指定 tmux ペインの属するウィンドウが現在アクティブ（前面表示中）か。判定不能なら None。
-/// tmux placeholder kitty で、別ウィンドウへ切り替わったとき画像を消すための可視判定に使う。
+/// Whether the window the given tmux pane belongs to is currently active (in the foreground). None
+/// if undeterminable. Used for the visibility check that clears the image when switching to another
+/// window with tmux placeholder kitty.
 fn pane_window_active(pane: &str) -> Option<bool> {
     let out = Command::new("tmux")
         .args(["display-message", "-p", "-t", pane, "#{window_active}"])
@@ -1843,8 +1902,8 @@ fn pane_window_active(pane: &str) -> Option<bool> {
     Some(String::from_utf8_lossy(&out.stdout).trim() == "1")
 }
 
-/// 受信した先頭メッセージに、チャネルに既に積まれている分をまとめて足してバーストにする。
-/// 連続する Reload/キーを1回の描画へ集約し、Quit が後ろに積まれても取りこぼさない。
+/// Add everything already queued on the channel to the received first message to form a burst.
+/// Coalesces consecutive Reloads/keys into a single draw, and doesn't miss a Quit queued behind them.
 fn drain_burst(first: Msg, rx: &mpsc::Receiver<Msg>) -> Vec<Msg> {
     let mut msgs = vec![first];
     while let Ok(m) = rx.try_recv() {
@@ -1853,10 +1912,11 @@ fn drain_burst(first: Msg, rx: &mpsc::Receiver<Msg>) -> Vec<Msg> {
     msgs
 }
 
-/// 連続入力中の画像転送の最小間隔（ms）。`VECVIEW_MIN_FRAME_MS` で上書き、最小 16。短いほど
-/// 追従が滑らかだが、端末を追い越してクラッシュさせるリスクが上がる。既定はバックエンド依存
-/// （`default`）：tmux passthrough（kitty placeholder / sixel）は転送が重く端末側に溜まりやすい
-/// ため保守的に、直接配置はネイティブで軽いため小さめにする。
+/// The minimum interval (ms) for image transfer during continuous input. Overridden by
+/// `VECVIEW_MIN_FRAME_MS`, minimum 16. Smaller is smoother to follow but raises the risk of
+/// outpacing the terminal and crashing it. The default is backend-dependent (`default`): tmux
+/// passthrough (kitty placeholder / sixel) is heavy to transfer and piles up on the terminal side,
+/// so be conservative; direct placement is native and light, so use a smaller value.
 fn min_frame_ms(default: u64) -> u64 {
     std::env::var("VECVIEW_MIN_FRAME_MS")
         .ok()
@@ -1865,8 +1925,9 @@ fn min_frame_ms(default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// passthrough sixel の定期再描画間隔（ms）。`VECVIEW_REDRAW_MS` で上書き、既定 1000、最小 100。
-/// 短いほど消えてから復元するまでが速いが、その分 sixel 再送の転送量が増える。
+/// The periodic redraw interval (ms) for passthrough sixel. Overridden by `VECVIEW_REDRAW_MS`,
+/// default 1000, minimum 100. Smaller restores faster after the image is cleared, but increases
+/// the transfer volume of sixel resends accordingly.
 fn redraw_interval_ms() -> u64 {
     std::env::var("VECVIEW_REDRAW_MS")
         .ok()
@@ -1875,7 +1936,7 @@ fn redraw_interval_ms() -> u64 {
         .unwrap_or(1000)
 }
 
-/// "幅x高"（区切りは `x` または `X`）を (幅, 高) に解析。各値は 1..=128 にクランプ。
+/// Parse "WxH" (separator `x` or `X`) into (width, height). Each value is clamped to 1..=128.
 fn parse_cell_px(s: &str) -> Option<(u32, u32)> {
     let (w, h) = s.trim().split_once(['x', 'X'])?;
     let w: u32 = w.trim().parse().ok()?;
@@ -1883,10 +1944,12 @@ fn parse_cell_px(s: &str) -> Option<(u32, u32)> {
     Some((w.clamp(1, 128), h.clamp(1, 128)))
 }
 
-/// スーパーサンプリング倍率を決める。優先順位は CLI 引数 > 環境変数 VECVIEW_SCALE > 既定1。
-/// いずれも 1..=4 にクランプする。既定を 1（等倍）にしているのは、tmux placeholder 経路で
-/// 高倍率にすると 1 フレームの転送量が倍率²で増え、連続操作で端末（Ghostty 等）が画像更新を
-/// 捌ききれずクラッシュしやすくなるため。シャープさが欲しく端末が耐える環境では 2 以上を指定する。
+/// Decide the supersampling factor. Precedence: CLI argument, then the VECVIEW_SCALE environment
+/// variable, then a default of 1. All are clamped to 1..=4. The default is 1 (native) because, on
+/// the tmux placeholder path, a high factor grows the per-frame transfer size with the square of the
+/// factor, making it easy for the terminal (Ghostty, etc.) to fail to keep up with image updates and
+/// crash under continuous operation. Specify 2 or higher in environments that want sharpness and can
+/// take it.
 fn resolve_scale(arg: Option<u32>) -> u32 {
     arg.or_else(|| {
         std::env::var("VECVIEW_SCALE")
@@ -1897,9 +1960,10 @@ fn resolve_scale(arg: Option<u32>) -> u32 {
     .clamp(1, 4)
 }
 
-/// ページ内の全パス頂点（制御点含む）から本文（ink）の外接矩形 [x, y, w, h] を求める。
-/// pdftocairo の SVG は全面背景矩形を持たないため、これが実際の本文境界になる。可視パスが
-/// 無ければ None。制御点を含むため厳密な曲線境界よりわずかに広いが、フィット用途では十分。
+/// Compute the bounding rect [x, y, w, h] of the content (ink) from all path vertices in the page
+/// (including control points). Since pdftocairo's SVG has no full-page background rect, this is the
+/// actual content boundary. None if there are no visible paths. Including control points makes it
+/// slightly wider than the exact curve boundary, but it's sufficient for fitting purposes.
 fn content_bbox(page: &Page) -> Option<[f32; 4]> {
     let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
     let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
@@ -1939,13 +2003,13 @@ fn content_bbox(page: &Page) -> Option<[f32; 4]> {
         .then_some([min_x, min_y, max_x - min_x, max_y - min_y])
 }
 
-/// 本文境界 `bbox` に合わせて `state` の zoom/center を設定する。Width=左右いっぱい、
-/// Height=上下いっぱい。zoom はフィット倍率(s0=100%)に対する比として求め、範囲にクランプ。
+/// Set `state`'s zoom/center to fit the content boundary `bbox`. Width = full left-right,
+/// Height = full top-bottom. zoom is computed as a ratio relative to the fit factor (s0=100%) and clamped to range.
 fn apply_fit(fit: Fit, bbox: [f32; 4], pw: f32, ph: f32, out_w: u32, out_h: u32, state: &mut ViewState) {
     let [bx, by, bw, bh] = bbox;
     let bw = bw.max(1.0);
     let bh = bh.max(1.0);
-    let s0 = (out_w as f32 / pw).min(out_h as f32 / ph); // ページ全体フィット(=100%)の倍率。
+    let s0 = (out_w as f32 / pw).min(out_h as f32 / ph); // The whole-page-fit (=100%) factor.
     let s = match fit {
         Fit::Width => out_w as f32 / bw,
         Fit::Height => out_h as f32 / bh,
@@ -1955,11 +2019,11 @@ fn apply_fit(fit: Fit, bbox: [f32; 4], pw: f32, ph: f32, out_w: u32, out_h: u32,
     state.center = Some((bx + bw / 2.0, by + bh / 2.0));
 }
 
-/// 端末が報告するサイズと、そこから算出する描画解像度を表示して終了する（解像度調査用）。
+/// Print the sizes the terminal reports and the render resolution derived from them, then exit (for investigating resolution).
 fn probe_and_exit(backend: Option<&str>, scale: u32) -> ! {
     let b = detect_backend(backend);
     println!("backend            = {}", b.name());
-    println!("scale (SS倍率)     = {scale}");
+    println!("scale (SS factor)  = {scale}");
     println!("TMUX env           = {}", std::env::var_os("TMUX").is_some());
     match crossterm::terminal::window_size() {
         Ok(ws) => {
@@ -1974,15 +2038,15 @@ fn probe_and_exit(backend: Option<&str>, scale: u32) -> ! {
                     ws.height as u32 / ws.rows as u32
                 );
             } else {
-                println!("cell size(px)      = 不明（ピクセル値が0 → 8x16 概算に落ちる）");
+                println!("cell size(px)      = unknown (pixel values are 0 -> falls back to 8x16 estimate)");
             }
         }
-        Err(e) => println!("window_size        = エラー: {e}"),
+        Err(e) => println!("window_size        = error: {e}"),
     }
     let (cw, ch) = fallback_cell_px();
-    println!("fallback cell(px)  = {cw} x {ch}  ← VECVIEW_CELL_PX で上書き可（ピクセル0時に使用）");
+    println!("fallback cell(px)  = {cw} x {ch}  <- overridable via VECVIEW_CELL_PX (used when pixels are 0)");
     let (w, h) = available_area(b.name(), scale);
-    println!("available_area(px) = {w} x {h}  ← この解像度でラスタ化している");
+    println!("available_area(px) = {w} x {h}  <- rasterizing at this resolution");
     std::process::exit(0);
 }
 
@@ -1992,9 +2056,9 @@ fn read_fb_virtual_size() -> Option<(u32, u32)> {
     Some((w.parse().ok()?, h.parse().ok()?))
 }
 
-/// 表示するページ内ビューポート矩形 [x, y, w, h] を求める。zoom=100 でページ全体が
-/// 表示領域に収まり（フィット）、zoom を上げるとビューポートが小さくなり中心 `center`
-/// 周辺を拡大する。ビューポートのアスペクト比は出力（out_w/out_h）に一致させ歪みを防ぐ。
+/// Compute the in-page viewport rect [x, y, w, h] to display. At zoom=100 the whole page fits the
+/// display area (fit); raising zoom shrinks the viewport and magnifies around the center `center`.
+/// The viewport's aspect ratio is matched to the output (out_w/out_h) to prevent distortion.
 fn viewport_for(
     pw: f32,
     ph: f32,
@@ -2017,8 +2081,9 @@ fn viewport_for(
     ]
 }
 
-/// 1軸のビューポート原点を決める。ビューポートがページより小さい（拡大中）ときは原点を
-/// ページ内に収めてページ外の白を見せない。大きい（フィット以下）ときは中央寄せ（letterbox）。
+/// Decide the viewport origin on one axis. When the viewport is smaller than the page (zoomed in),
+/// keep the origin within the page so the white outside the page isn't shown. When larger (at or
+/// below fit), center it (letterbox).
 fn clamp_origin(center: f32, v: f32, p: f32) -> f32 {
     if v >= p {
         (p - v) / 2.0
@@ -2056,12 +2121,12 @@ mod tests {
         assert_eq!(parse_key("space"), Some((KeyCode::Char(' '), false)));
         assert_eq!(parse_key("PageDown"), Some((KeyCode::PageDown, false)));
         assert_eq!(parse_key("esc"), Some((KeyCode::Esc, false)));
-        assert_eq!(parse_key("foo"), None); // 複数文字の未知名は不可。
+        assert_eq!(parse_key("foo"), None); // An unknown multi-character name is disallowed.
     }
 
     #[test]
     fn default_bindings_match_request() {
-        // 既定: 矢印=パン、j/k=ページ送り/戻り、h/l=先頭/最終ページ。
+        // Defaults: arrows = pan, j/k = next/previous page, h/l = first/last page.
         let km = Keymap::build(&HashMap::new());
         assert!(matches!(km.action(&key(KeyCode::Up, false)), Some(Action::Pan(0.0, -1.0))));
         assert!(matches!(km.action(&key(KeyCode::Down, false)), Some(Action::Pan(0.0, 1.0))));
@@ -2072,19 +2137,19 @@ mod tests {
         assert!(matches!(km.action(&key(KeyCode::Char('h'), false)), Some(Action::FirstPage)));
         assert!(matches!(km.action(&key(KeyCode::Char('l'), false)), Some(Action::LastPage)));
         assert!(matches!(km.action(&key(KeyCode::Char('c'), true)), Some(Action::Quit)));
-        // 旧パン hjkl は既定では割り当てなし（h/l は別アクション、j/k はページ）。
+        // The old hjkl pan is unassigned by default (h/l are different actions, j/k are pages).
         assert!(matches!(km.action(&key(KeyCode::Char('j'), false)), Some(Action::NextPage)));
     }
 
     #[test]
     fn override_replaces_action_keys() {
-        // next_page を space のみへ。j は未割り当てになる。
+        // Set next_page to space only. j becomes unassigned.
         let mut ov = HashMap::new();
         ov.insert("next_page".to_string(), vec!["space".to_string()]);
         let km = Keymap::build(&ov);
         assert!(matches!(km.action(&key(KeyCode::Char(' '), false)), Some(Action::NextPage)));
         assert!(km.action(&key(KeyCode::Char('j'), false)).is_none());
-        // 上書きしていない prev_page は既定の k のまま。
+        // prev_page, which wasn't overridden, stays at the default k.
         assert!(matches!(km.action(&key(KeyCode::Char('k'), false)), Some(Action::PrevPage)));
     }
 
@@ -2121,7 +2186,7 @@ mod tests {
 
     #[test]
     fn copy_mode_groups_lines_and_drops_control_chars() {
-        // 2行（y=0 と y=20）。間に pdfium 由来の \r\n（矩形ゼロの制御文字）を挟む。
+        // Two lines (y=0 and y=20), with pdfium-derived \r\n (zero-rect control characters) in between.
         let glyphs = vec![
             glyph('a', 0.0, 0.0),
             glyph('b', 8.0, 0.0),
@@ -2131,7 +2196,7 @@ mod tests {
             glyph('d', 8.0, 20.0),
         ];
         let cm = super::CopyMode::new(glyphs).unwrap();
-        // 制御文字は除外され、可視4文字が2行に分かれる。
+        // Control characters are excluded, and the 4 visible characters split into 2 lines.
         assert_eq!(cm.glyphs.len(), 4);
         assert_eq!(cm.lines.len(), 2);
         assert_eq!(cm.lines[0], vec![0, 1]);
@@ -2147,9 +2212,9 @@ mod tests {
         ];
         let mut cm = super::CopyMode::new(glyphs).unwrap();
         cm.anchor = Some(0);
-        cm.cursor = 2; // 全選択。
+        cm.cursor = 2; // Select all.
         assert_eq!(cm.selected_text(), "ab\nc");
-        // 未選択ならキャレット1文字のみ。
+        // If unselected, only the single caret character.
         cm.anchor = None;
         cm.cursor = 1;
         assert_eq!(cm.selected_text(), "b");
@@ -2157,7 +2222,7 @@ mod tests {
 
     #[test]
     fn copy_mode_vertical_move_keeps_column() {
-        // 2行、各3文字。上の行で2文字目にいて下へ→下の行の2文字目付近へ。
+        // Two lines, 3 characters each. On the upper line at the 2nd character, move down -> near the 2nd character of the lower line.
         let glyphs = vec![
             glyph('a', 0.0, 0.0),
             glyph('b', 8.0, 0.0),
@@ -2167,16 +2232,16 @@ mod tests {
             glyph('f', 16.0, 20.0),
         ];
         let mut cm = super::CopyMode::new(glyphs).unwrap();
-        cm.cursor = 1; // 'b'（x≈8）。
+        cm.cursor = 1; // 'b' (x≈8).
         cm.move_line(1);
-        assert_eq!(cm.glyphs[cm.cursor].ch, 'e'); // 下行の同桁。
+        assert_eq!(cm.glyphs[cm.cursor].ch, 'e'); // Same column on the lower line.
         cm.move_line(-1);
         assert_eq!(cm.glyphs[cm.cursor].ch, 'b');
     }
 
     #[test]
     fn content_bbox_spans_all_vertices() {
-        // 2本のパスの全頂点（制御点含む）を覆う外接矩形。
+        // The bounding rect covering all vertices (including control points) of two paths.
         let page = Page {
             width: 1000.0,
             height: 1000.0,
@@ -2191,7 +2256,7 @@ mod tests {
                 ]),
             ],
         };
-        // x:200..700, y:300..700 → [200,300, 500,400]。
+        // x:200..700, y:300..700 -> [200,300, 500,400].
         assert_eq!(content_bbox(&page), Some([200.0, 300.0, 500.0, 400.0]));
     }
 
@@ -2207,8 +2272,8 @@ mod tests {
 
     #[test]
     fn fit_width_fills_output_width_and_centers_on_content() {
-        // ページ 1000x1000 を 1000x1000 出力へ（s0=1）。本文 [200,300,600,400]。
-        // 左右フィット: s=out_w/bw=1000/600=1.667 → zoom=167%、中心=本文中心(500,500)。
+        // Page 1000x1000 into 1000x1000 output (s0=1). Content [200,300,600,400].
+        // Width fit: s=out_w/bw=1000/600=1.667 -> zoom=167%, center = content center (500,500).
         let mut s = state();
         apply_fit(Fit::Width, [200.0, 300.0, 600.0, 400.0], 1000.0, 1000.0, 1000, 1000, &mut s);
         assert_eq!(s.zoom, 167);
@@ -2217,7 +2282,7 @@ mod tests {
 
     #[test]
     fn fit_height_fills_output_height() {
-        // 上下フィット: s=out_h/bh=1000/400=2.5 → zoom=250%、中心=本文中心。
+        // Height fit: s=out_h/bh=1000/400=2.5 -> zoom=250%, center = content center.
         let mut s = state();
         apply_fit(Fit::Height, [200.0, 300.0, 600.0, 400.0], 1000.0, 1000.0, 1000, 1000, &mut s);
         assert_eq!(s.zoom, 250);
@@ -2228,14 +2293,14 @@ mod tests {
     fn parse_cell_px_accepts_x_separator_and_clamps() {
         assert_eq!(parse_cell_px("10x17"), Some((10, 17)));
         assert_eq!(parse_cell_px(" 12 X 24 "), Some((12, 24)));
-        assert_eq!(parse_cell_px("0x999"), Some((1, 128))); // 1..=128 にクランプ
+        assert_eq!(parse_cell_px("0x999"), Some((1, 128))); // clamped to 1..=128
         assert_eq!(parse_cell_px("8"), None);
         assert_eq!(parse_cell_px("axb"), None);
     }
 
     #[test]
     fn scale_precedence_arg_over_env_with_clamp() {
-        // 引数が最優先。範囲外は 1..=4 にクランプ。
+        // The argument takes top priority. Out-of-range values are clamped to 1..=4.
         assert_eq!(resolve_scale(Some(3)), 3);
         assert_eq!(resolve_scale(Some(9)), 4);
         assert_eq!(resolve_scale(Some(0)), 1);
@@ -2243,24 +2308,24 @@ mod tests {
 
     #[test]
     fn fit_shows_whole_page_centered() {
-        // 2:1 ページを 1000x1000 へ。フィット倍率は幅律速 s0=5、ビューポート = 200x200、
-        // 中心(100,50) なので [0, -50, 200, 200]（上下に余白）。
+        // A 2:1 page into 1000x1000. The fit factor is width-limited at s0=5, viewport = 200x200,
+        // and center (100,50), giving [0, -50, 200, 200] (margins top and bottom).
         let vp = viewport_for(200.0, 100.0, 1000, 1000, 100, (100.0, 50.0));
         assert_eq!(vp, [0.0, -50.0, 200.0, 200.0]);
     }
 
     #[test]
     fn zoom_in_shrinks_viewport_around_center() {
-        // 200% で正方ページ 100x100 を 1000x1000 に。s0=10, s=20, ビューポート=50x50、
-        // 中心(50,50) → [25, 25, 50, 50]。
+        // At 200%, a square 100x100 page into 1000x1000. s0=10, s=20, viewport=50x50,
+        // center (50,50) -> [25, 25, 50, 50].
         let vp = viewport_for(100.0, 100.0, 1000, 1000, 200, (50.0, 50.0));
         assert_eq!(vp, [25.0, 25.0, 50.0, 50.0]);
     }
 
     #[test]
     fn viewport_clamped_inside_page_at_edge() {
-        // 端へパンしても、拡大中はビューポートがページ外（白）へはみ出さない。
-        // 100x100, 200%, ビューポート 50x50、中心を右下角(100,100)に → 原点は [50,50] でクランプ。
+        // Even when panning to the edge, while zoomed in the viewport doesn't overflow outside the page (white).
+        // 100x100, 200%, viewport 50x50, center at the bottom-right corner (100,100) -> origin clamped at [50,50].
         let vp = viewport_for(100.0, 100.0, 1000, 1000, 200, (100.0, 100.0));
         assert_eq!(vp, [50.0, 50.0, 50.0, 50.0]);
     }

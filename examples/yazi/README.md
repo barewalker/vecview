@@ -1,77 +1,87 @@
 # vv.yazi — yazi previewer
 
-[yazi](https://yazi-rs.github.io/) のプレビューペインに **SVG / Typst / PDF** を
-`vv --render` で描画して表示する previewer プラグイン。とくに **Typst（`.typ`）は yazi が
-ネイティブにプレビューできない**ため、ここが主な価値。
+A previewer plugin that renders **SVG / Typst / PDF** with `vv --render` and
+displays it in [yazi](https://yazi-rs.github.io/)'s preview pane. The main value
+is **Typst (`.typ`), which yazi can't preview natively**.
 
-描画は vv 本体と同じ経路（PDF=pdfium、SVG/Typst=wgpu）なので、本表示とプレビューで見た目が一致する。
+Rendering goes through the same path as vv itself (PDF = pdfium,
+SVG/Typst = wgpu), so the preview looks identical to the main display.
 
-## 必要なもの
+## Requirements
 
-- PATH に `vv`（本リポジトリの vecview。`cargo install --path crates/vecview`）
-- yazi **26 以降**（`ya.mgr_emit` を使用）
-- Typst プレビューには `typst`、PDF には `libpdfium`（vv の実行時依存と同じ）
+- `vv` on `PATH` (the vecview in this repo; `cargo install --path crates/vecview`)
+- yazi **26 or later** (uses `ya.mgr_emit`)
+- `typst` for Typst previews and `libpdfium` for PDFs (same as vv's runtime
+  dependencies)
 
-## インストール
+## Installation
 
-プラグイン本体を yazi のプラグインディレクトリへ置く:
+Place the plugin itself in yazi's plugin directory:
 
 ```bash
 mkdir -p ~/.config/yazi/plugins
 cp -r examples/yazi/vv.yazi ~/.config/yazi/plugins/
 ```
 
-`~/.config/yazi/yazi.toml` の `[plugin]` に previewer ルールを追加する（既定より優先させるため
-`prepend_previewers`）:
+Add a previewer rule under `[plugin]` in `~/.config/yazi/yazi.toml` (use
+`prepend_previewers` to take priority over the defaults):
 
 ```toml
 [plugin]
 prepend_previewers = [
-    { url = "*.typ", run = "vv" },              # Typst（yazi 非対応 → これが本命）
-    { url = "*.svg", run = "vv" },              # SVG（任意）
-    { mime = "application/pdf", run = "vv" },   # PDF（任意。yazi 既定の方が速い場合あり）
+    { url = "*.typ", run = "vv" },              # Typst (unsupported by yazi → the main reason to use this)
+    { url = "*.svg", run = "vv" },              # SVG (optional)
+    { mime = "application/pdf", run = "vv" },   # PDF (optional; yazi's default may be faster)
 ]
-# SVG は画像 mime のため、yazi 標準の画像プリローダが外部 `resvg` で svg→PNG 変換しようとする
-# （resvg 未導入だと "Failed to start resvg" エラー）。プリローダを noop にして vv 経路へ一本化する。
+# Because SVG has an image mime type, yazi's standard image preloader tries to
+# convert svg→PNG with the external `resvg` (you get a "Failed to start resvg"
+# error if resvg isn't installed). Make the preloader a noop to route everything
+# through vv.
 prepend_preloaders = [
     { url = "*.svg", run = "noop" },
 ]
 ```
 
-`.typ` だけで十分なら svg/pdf の行は外してよい。
+If `.typ` alone is enough, you can drop the svg/pdf lines.
 
-> SVG を vv で扱わず **yazi 標準の svg プレビュー**で済ませたい場合は、上の svg 行と preloaders を
-> 消して、代わりに `resvg` を入れる（`cargo install resvg`）。resvg は usvg ベースで vv と同じ描画
-> エンジンなので画質は同等。
+> If you'd rather not handle SVG with vv and just use **yazi's standard svg
+> preview**, remove the svg line and the preloaders above and install `resvg`
+> instead (`cargo install resvg`). resvg is based on usvg — the same rendering
+> engine as vv — so the quality is equivalent.
 
-## tmux + Ghostty のクラッシュについて（重要）
+## On the tmux + Ghostty crash (important)
 
-**Ghostty を tmux 越しで使うと、画像プレビューで Ghostty 自体が落ちることがある。これは
-vecview ではなく Ghostty 側の既知バグ**で、yazi 標準の画像（png/jpg）でも、ネイティブの kitty 画像
-全般でも起きる（tmux 非経由のネイティブでは起きない）。報告された発生条件:
+**When you use Ghostty over tmux, image previews can crash Ghostty itself. This
+is a known bug on Ghostty's side, not in vecview**, and it happens with yazi's
+standard images (png/jpg) and with native kitty images in general (it does not
+happen natively, without tmux). The reported conditions:
 
-- tmux の **`mouse on`** で発生（**`mouse off` だと起きない**）
-- ウィンドウが **~90x40 セルより大きい**（最大化）と発生
-- 画像が **~100KB 超**で発生
+- Occurs with tmux's **`mouse on`** (**does not occur with `mouse off`**)
+- Occurs when the window is **larger than ~90x40 cells** (maximized)
+- Occurs when the image is **over ~100KB**
 
-参考: ghostty-org/ghostty discussions [#11909](https://github.com/ghostty-org/ghostty/discussions/11909) /
+References: ghostty-org/ghostty discussions
+[#11909](https://github.com/ghostty-org/ghostty/discussions/11909) /
 [#4266](https://github.com/ghostty-org/ghostty/discussions/4266) /
 [#9197](https://github.com/ghostty-org/ghostty/discussions/9197)
 
-回避策:
+Workarounds:
 
-- **tmux のマウスを切る**（`set -g mouse off`、または `prefix+m` でトグル運用）— 最も確実
-- ウィンドウを最大化しない（小さめなら `mouse on` でも出にくい）
-- Ghostty を更新する（活発に修正されている領域）
-- 重く使うときは tmux の外（ネイティブ端末）で yazi を使う
+- **Turn off tmux mouse** (`set -g mouse off`, or toggle it with `prefix+m`) —
+  the most reliable
+- Don't maximize the window (with a smaller window it's less likely even with
+  `mouse on`)
+- Update Ghostty (this area is being actively fixed)
+- For heavy use, run yazi outside tmux (in a native terminal)
 
-なお `[preview] image_delay`（0〜100ms）や `max_width`/`max_height` を控えめにすると緩和には
-なるが、上記バグの根治にはならない。
+Lowering `[preview] image_delay` (0–100ms) or `max_width`/`max_height` helps
+somewhat, but it doesn't fully fix the bug above.
 
-## メモ
+## Notes
 
-- **初回の表示は重い**（`typst compile` ＋ wgpu 初期化）。yazi がページ単位でキャッシュするので、
-  同じファイルの2回目以降は即時。
-- 画質は端末プロトコルに依存する。Ghostty / kitty なら `~/.config/yazi/yazi.toml` の
-  `[preview] preview_protocol = "kitty"` が最高画質（sixel は 256 色に減色）。
-- 複数ページ文書はプレビュー上でスクロールするとページが送られる。
+- **The first render is slow** (`typst compile` + wgpu initialization). yazi
+  caches per page, so the same file is instant on the second view onward.
+- Image quality depends on the terminal protocol. On Ghostty / kitty, setting
+  `[preview] preview_protocol = "kitty"` in `~/.config/yazi/yazi.toml` gives the
+  best quality (sixel is reduced to 256 colors).
+- For multi-page documents, scrolling in the preview turns the page.

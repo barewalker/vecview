@@ -1,22 +1,22 @@
-//! Linux Framebuffer バックエンド（`/dev/fb0`）。ネイティブ解像度で直接描画する。
+//! Linux Framebuffer backend (`/dev/fb0`). Draws directly at native resolution.
 //!
-//! ベクター品質が最も活きる経路。`ioctl` で解像度・ビット深度・stride（`line_length`）と
-//! ピクセルフォーマット（R/G/B のビット位置）を取得し、`mmap` でフレームバッファに
-//! RGBA を変換して書き込む。
+//! The path where vector quality shines the most. Via `ioctl` it obtains the resolution, bit depth,
+//! stride (`line_length`), and pixel format (the bit positions of R/G/B), then converts RGBA and
+//! writes it to the framebuffer via `mmap`.
 //!
-//! 実機（bare TTY 上の `/dev/fb0`）でのみ表示確認できるため、ピクセル変換ロジックは
-//! [`blit`] という純粋関数に切り出してユニットテスト可能にしている。
+//! Since display can only be verified on real hardware (`/dev/fb0` on a bare TTY), the pixel
+//! conversion logic is factored out into a pure function [`blit`] to make it unit-testable.
 
 use anyhow::{anyhow, Result};
 use vecview_core::OutputBackend;
 
-/// フレームバッファのピクセル配置情報（`ioctl` 取得値から必要分のみ抽出）。
+/// Framebuffer pixel layout info (only the parts we need, extracted from the `ioctl` values).
 #[derive(Clone, Copy, Debug)]
 pub struct FbInfo {
     pub xres: u32,
     pub yres: u32,
     pub bits_per_pixel: u32,
-    /// 1行あたりのバイト数（stride）。`xres * bpp/8` とは限らない。
+    /// Bytes per row (stride). Not necessarily `xres * bpp/8`.
     pub line_length: u32,
     pub red_offset: u32,
     pub green_offset: u32,
@@ -25,12 +25,13 @@ pub struct FbInfo {
     pub transp_length: u32,
 }
 
-/// RGBA 画像を `dst`（フレームバッファ相当のバイト列）へ左上基準で書き込む純粋関数。
-/// stride とピクセルフォーマット（R/G/B/A のビット位置）を考慮する。32bpp / 24bpp 対応。
+/// A pure function that writes an RGBA image into `dst` (the framebuffer-equivalent byte slice),
+/// anchored at the top-left. It accounts for stride and pixel format (the bit positions of
+/// R/G/B/A). Supports 32bpp / 24bpp.
 pub fn blit(dst: &mut [u8], rgba: &[u8], img_w: u32, img_h: u32, fb: &FbInfo) {
     let bytes_per_pixel = (fb.bits_per_pixel / 8) as usize;
     if bytes_per_pixel < 3 {
-        return; // 16bpp 等は未対応（初回スコープ外）。
+        return; // 16bpp etc. is unsupported (out of scope for the first pass).
     }
     let copy_w = img_w.min(fb.xres) as usize;
     let copy_h = img_h.min(fb.yres) as usize;
@@ -44,7 +45,7 @@ pub fn blit(dst: &mut [u8], rgba: &[u8], img_w: u32, img_h: u32, fb: &FbInfo) {
             if dst_off + bytes_per_pixel > dst.len() {
                 continue;
             }
-            // 各成分をビットオフセット位置（/8 でバイト位置）へ配置。
+            // Place each component at its bit-offset position (/8 gives the byte position).
             dst[dst_off + (fb.red_offset / 8) as usize] = r;
             dst[dst_off + (fb.green_offset / 8) as usize] = g;
             dst[dst_off + (fb.blue_offset / 8) as usize] = b;
@@ -85,7 +86,7 @@ impl OutputBackend for FramebufferBackend {
             .read(true)
             .write(true)
             .open(&self.path)
-            .map_err(|e| anyhow!("{} を開けません（video グループ/権限を確認）: {e}", self.path))?;
+            .map_err(|e| anyhow!("cannot open {} (check the video group/permissions): {e}", self.path))?;
 
         let fb = unsafe { read_fb_info(file.as_raw_fd()) }?;
 
@@ -97,7 +98,7 @@ impl OutputBackend for FramebufferBackend {
 
     #[cfg(not(target_os = "linux"))]
     fn display(&self, _rgba: &[u8], _width: u32, _height: u32) -> Result<()> {
-        Err(anyhow!("framebuffer は Linux でのみ利用可能"))
+        Err(anyhow!("framebuffer is only available on Linux"))
     }
 }
 
@@ -122,7 +123,7 @@ unsafe fn read_fb_info(fd: std::os::fd::RawFd) -> Result<FbInfo> {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    //! `<linux/fb.h>` の構造体と ioctl 定義（必要分）。
+    //! `<linux/fb.h>` structs and ioctl definitions (only what we need).
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -186,7 +187,7 @@ mod linux {
         pub reserved: [u16; 2],
     }
 
-    // FBIOGET_VSCREENINFO = 0x4600 / FBIOGET_FSCREENINFO = 0x4602（レガシー番号）。
+    // FBIOGET_VSCREENINFO = 0x4600 / FBIOGET_FSCREENINFO = 0x4602 (legacy numbers).
     nix::ioctl_read_bad!(fbioget_vscreeninfo, 0x4600, fb_var_screeninfo);
     nix::ioctl_read_bad!(fbioget_fscreeninfo, 0x4602, fb_fix_screeninfo);
 }
@@ -196,7 +197,7 @@ mod tests {
     use super::*;
 
     fn bgra_info(xres: u32, yres: u32, line_length: u32) -> FbInfo {
-        // 一般的な BGRA32: B=offset0, G=8, R=16, A=24。
+        // Typical BGRA32: B=offset0, G=8, R=16, A=24.
         FbInfo {
             xres,
             yres,
@@ -214,32 +215,34 @@ mod tests {
     fn blit_bgra_respects_offsets() {
         let fb = bgra_info(2, 2, 8); // stride == width*4
         let mut dst = vec![0u8; 16];
-        // 1ピクセル目を RGBA(10,20,30,40)。
-        let rgba = vec![10, 20, 30, 40, /* 残り3px */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        // First pixel is RGBA(10,20,30,40).
+        let rgba = vec![10, 20, 30, 40, /* remaining 3px */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         blit(&mut dst, &rgba, 2, 2, &fb);
-        // BGRA 並び: dst[0]=B(30), [1]=G(20), [2]=R(10), [3]=A(40)。
+        // BGRA order: dst[0]=B(30), [1]=G(20), [2]=R(10), [3]=A(40).
         assert_eq!(&dst[0..4], &[30, 20, 10, 40]);
     }
 
     #[test]
     fn blit_honors_stride() {
-        // stride が幅より大きい場合（line_length=12 > 2px*4=8）、2行目は offset 12 から。
+        // When stride is larger than the width (line_length=12 > 2px*4=8), the second row starts
+        // at offset 12.
         let fb = bgra_info(2, 2, 12);
         let mut dst = vec![0u8; 24];
         let mut rgba = vec![0u8; 16];
-        // (x=0,y=1) を赤(255,0,0,255)。インデックス = (y*width + x) * 4 = (1*2+0)*4 = 8。
+        // (x=0,y=1) is red(255,0,0,255). index = (y*width + x) * 4 = (1*2+0)*4 = 8.
         let src = 8usize;
         rgba[src] = 255;
         rgba[src + 3] = 255;
         blit(&mut dst, &rgba, 2, 2, &fb);
-        // 2行目先頭は stride=12 の位置。R は blue offset0 ではなく red_offset16→ byte2。
+        // The start of the second row is at the stride=12 position. R is at red_offset16 -> byte2,
+        // not blue offset0.
         assert_eq!(dst[12 + 2], 255); // R
         assert_eq!(dst[12 + 3], 255); // A
     }
 
     #[test]
     fn blit_clips_oversize_image() {
-        // 画像 4x4 をフレームバッファ 2x2 にクリップ。境界外書き込みでパニックしない。
+        // Clip a 4x4 image to a 2x2 framebuffer. Out-of-bounds writes must not panic.
         let fb = bgra_info(2, 2, 8);
         let mut dst = vec![0u8; 16];
         let rgba = vec![100u8; 4 * 4 * 4];

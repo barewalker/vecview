@@ -1,12 +1,13 @@
-//! Kitty Graphics Protocol バックエンド。RGBA8 を `f=32` で直接転送する。
+//! Kitty Graphics Protocol backend. Transfers RGBA8 directly with `f=32`.
 //!
-//! 2つの配置モードを持つ：
-//! - **直接配置**（非 tmux）：`a=T` でカーソル位置に画像を直接表示する。
-//! - **Unicode プレースホルダ**（tmux）：画像を仮想配置（`U=1`）として転送し、`U+10EEEE`
-//!   プレースホルダ文字に行・列 diacritics を付けた「テキストセル」を描画する。tmux は
-//!   これを通常のテキストセルとして追跡するため、画像がペイン境界内に正しく収まる。
-//!   `a=T` 直接配置は tmux がグラフィクスのペイン配置を理解せず常にウィンドウ左上に
-//!   出てしまうため、tmux 内ではこちらを使う。tmux 側 `set -g allow-passthrough on` が必要。
+//! It has two placement modes:
+//! - **Direct placement** (non-tmux): `a=T` displays the image directly at the cursor position.
+//! - **Unicode placeholder** (tmux): the image is transferred as a virtual placement (`U=1`), and
+//!   "text cells" are drawn using the `U+10EEEE` placeholder character with row/column diacritics.
+//!   tmux tracks these as ordinary text cells, so the image stays correctly within the pane
+//!   boundaries. This mode is used inside tmux because `a=T` direct placement would otherwise
+//!   always end up at the top-left of the window, since tmux does not understand the pane
+//!   placement of graphics. Requires `set -g allow-passthrough on` on the tmux side.
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -18,40 +19,44 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use vecview_core::OutputBackend;
 
-/// RGBA を zlib（RFC 1950）で圧縮する。kitty graphics の `o=z` で送る前段。圧縮レベルは
-/// 速度優先（白背景中心のページは低レベルでも十分縮む）。Vec への書き込みは失敗しない。
+/// Compresses RGBA with zlib (RFC 1950). Prepares data to send via kitty graphics `o=z`. The
+/// compression level favors speed (mostly-white pages compress well even at a low level). Writing
+/// to a Vec never fails.
 fn zlib_compress(data: &[u8]) -> Vec<u8> {
     let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
     let _ = enc.write_all(data);
     enc.finish().unwrap_or_default()
 }
 
-/// base64 ペイロードの1チャンク最大長（Kitty 推奨の 4096 バイト）。
+/// Maximum length of one chunk of the base64 payload (Kitty's recommended 4096 bytes).
 const CHUNK: usize = 4096;
 
-/// Unicode プレースホルダ文字 U+10EEEE。
+/// Unicode placeholder character U+10EEEE.
 const PLACEHOLDER: char = '\u{10EEEE}';
 
 pub struct KittyBackend {
-    /// tmux passthrough（＋プレースホルダ配置）を使うか。
+    /// Whether to use tmux passthrough (plus placeholder placement).
     tmux: bool,
-    /// この vecview インスタンス固有の画像 ID の基底（23bit）。Kitty の画像 ID は端末でグローバル
-    /// なので、複数ウィンドウで複数の vecview が動くと固定 ID では互いに上書き・誤削除し合う。PID
-    /// から一意な値を作り、プレースホルダの前景色（24bit トゥルーカラー）で符号化する。ダブル
-    /// バッファのため bit23 を立てた値と交互に使う（[`next_id`](Self::next_id)）。
+    /// Base of the image IDs (23 bits) unique to this vecview instance. Kitty image IDs are global
+    /// to the terminal, so when multiple vecviews run across multiple windows, a fixed ID would
+    /// cause them to overwrite and wrongly delete each other's images. We derive a unique value
+    /// from the PID and encode it in the placeholder's foreground color (24-bit truecolor). For
+    /// double buffering we alternate this with the value that has bit23 set ([`next_id`](Self::next_id)).
     base_id: u32,
-    /// 次に使うバッファ（false=base_id, true=base_id|0x800000）。display のたびに反転する。
+    /// The buffer to use next (false=base_id, true=base_id|0x800000). Flips on every display.
     toggle: RefCell<bool>,
-    /// 現在表示中（直前フレーム）の画像 ID。次フレームを描き終えた後に解放する対象。
+    /// The image ID currently displayed (the previous frame). To be freed after the next frame is drawn.
     live: RefCell<Option<u32>>,
-    /// 直近の placeholder 占有セル数（列, 行）。変化時のみ全消去して前フレームの残セルを掃除する。
+    /// The most recent placeholder cell footprint (cols, rows). Only on a change do we clear the
+    /// whole screen to sweep away the previous frame's leftover cells.
     last_footprint: RefCell<Option<(u32, u32)>>,
 }
 
 impl KittyBackend {
     pub fn new(tmux: bool) -> Self {
-        // PID を 23bit に収めて基底 ID とする（0 は避ける）。bit23 はダブルバッファのトグルに使う
-        // ため空けておく。並行する別インスタンスと衝突する確率は実質ゼロ。
+        // Fit the PID into 23 bits to use as the base ID (avoiding 0). Leave bit23 free, as it is
+        // used for the double-buffer toggle. The chance of colliding with another concurrent
+        // instance is effectively zero.
         let base_id = (std::process::id() & 0x007F_FFFF).max(1);
         Self {
             tmux,
@@ -62,9 +67,11 @@ impl KittyBackend {
         }
     }
 
-    /// 次フレームに使う画像 ID（base_id と base_id|bit23 を交互に）。ダブルバッファで、新フレーム
-    /// を旧フレームとは別 ID に転送し、旧 ID は描画後に解放することで、転送中に画面を消さずに
-    /// 切り替える（点滅防止）。各 ID は再利用前に必ず解放されるので端末側に溜まらない。
+    /// The image ID to use for the next frame (alternating between base_id and base_id|bit23). With
+    /// double buffering, the new frame is transferred under a different ID than the old frame, and
+    /// the old ID is freed after drawing, so we switch without clearing the screen during transfer
+    /// (preventing flicker). Each ID is always freed before reuse, so nothing accumulates on the
+    /// terminal side.
     fn next_id(&self) -> u32 {
         let mut t = self.toggle.borrow_mut();
         *t = !*t;
@@ -75,26 +82,26 @@ impl KittyBackend {
         }
     }
 
-    /// 指定 ID の画像と placement を解放する APC を書く（d=I,i=id）。自 ID だけ消すので他インスタンス
-    /// の画像は巻き込まない。
+    /// Writes an APC that frees the image and placement for the given ID (d=I,i=id). It only deletes
+    /// our own ID, so it does not affect other instances' images.
     fn delete_id(&self, out: &mut impl Write, id: u32) -> std::io::Result<()> {
         let body = format!("_Ga=d,d=I,i={id}");
         self.write_apc(out, body.as_bytes())
     }
 
-    /// 自インスタンスが使う2つの画像 ID をすべて解放する（クリア/終了時）。
+    /// Frees both image IDs used by this instance (on clear/exit).
     fn delete_own(&self, out: &mut impl Write) -> std::io::Result<()> {
         self.delete_id(out, self.base_id)?;
         self.delete_id(out, self.base_id | 0x0080_0000)?;
         Ok(())
     }
 
-    /// APC グラフィクスシーケンスを（必要なら tmux ラップして）書き出す。
-    /// `body` は `_G...` 部分（先頭 ESC と終端 ST を含まない中身）。
+    /// Writes out an APC graphics sequence (wrapping it for tmux if necessary).
+    /// `body` is the `_G...` part (the content, without the leading ESC or trailing ST).
     fn write_apc(&self, out: &mut impl Write, body: &[u8]) -> std::io::Result<()> {
         if self.tmux {
             out.write_all(b"\x1bPtmux;")?;
-            // 内側 APC シーケンス全体（ESC 含む）の ESC を二重化して埋め込む。
+            // Embed the entire inner APC sequence (including the ESC), doubling each ESC.
             let mut seq = Vec::with_capacity(body.len() + 4);
             seq.extend_from_slice(b"\x1b");
             seq.extend_from_slice(body);
@@ -115,11 +122,12 @@ impl KittyBackend {
         Ok(())
     }
 
-    /// 画像データを 4096 バイト区切りで転送する。`first_control` は先頭チャンクに付ける
-    /// 制御キー列（例: `a=T,f=32,s=W,v=H`）。
+    /// Transfers the image data in 4096-byte chunks. `first_control` is the control-key string
+    /// attached to the first chunk (e.g. `a=T,f=32,s=W,v=H`).
     fn transmit(&self, out: &mut impl Write, rgba: &[u8], first_control: &str) -> std::io::Result<()> {
-        // RGBA は大半が同色（白背景）になりがちなので zlib 圧縮（o=z）が劇的に効く。
-        // s/v（画素寸法）は非圧縮サイズのまま。tmux passthrough 経由の転送量を大きく削減する。
+        // RGBA tends to be mostly a single color (white background), so zlib compression (o=z) is
+        // dramatically effective. s/v (pixel dimensions) stay at the uncompressed size. This greatly
+        // reduces the amount transferred over tmux passthrough.
         let payload = STANDARD.encode(zlib_compress(rgba));
         let bytes = payload.as_bytes();
         let chunks: Vec<&[u8]> = bytes.chunks(CHUNK).collect();
@@ -138,15 +146,18 @@ impl KittyBackend {
         Ok(())
     }
 
-    /// 直接配置（非 tmux）：ダブルバッファで、旧画像を表示したまま新画像を同じ原点へ重ね、覆って
-    /// から旧画像を解放する。2J で全消去しないので、消去〜新画像到着の空白フレーム（点滅）が出ない。
+    /// Direct placement (non-tmux): with double buffering, the new image is overlaid at the same
+    /// origin while the old image stays displayed, and the old image is freed only after being
+    /// covered. Since we don't clear the whole screen with 2J, there is no blank frame (flicker)
+    /// between erasing and the new image arriving.
     fn display_direct(&self, out: &mut impl Write, rgba: &[u8], w: u32, h: u32) -> std::io::Result<()> {
         let new_id = self.next_id();
         let old = *self.live.borrow();
-        // カーソルを原点へ戻し、旧画像を表示したまま新画像を同寸法で重ねて表示（覆うので空白なし）。
+        // Move the cursor back to the origin and overlay the new image at the same size while the
+        // old image stays displayed (it covers it, so there is no blank).
         out.write_all(b"\x1b[H")?;
         self.transmit(out, rgba, &format!("a=T,q=2,i={new_id},f=32,s={w},v={h}"))?;
-        // 新画像が覆ったので旧画像を解放（端末側の画像は常に1〜2枚に収まる）。
+        // The new image now covers it, so free the old image (the terminal always holds 1-2 images).
         if let Some(old_id) = old {
             if old_id != new_id {
                 self.delete_id(out, old_id)?;
@@ -156,35 +167,38 @@ impl KittyBackend {
         Ok(())
     }
 
-    /// Unicode プレースホルダ配置（tmux）：画像を仮想配置として転送し、プレースホルダ
-    /// セルを描画する。セルは通常テキストなので tmux がペイン内に正しく配置する。
+    /// Unicode placeholder placement (tmux): transfers the image as a virtual placement and draws
+    /// placeholder cells. The cells are ordinary text, so tmux places them correctly within the pane.
     fn display_placeholder(&self, out: &mut impl Write, rgba: &[u8], w: u32, h: u32) -> std::io::Result<()> {
         let (cols, rows) = cell_footprint(w, h);
         let new_id = self.next_id();
         let old = *self.live.borrow();
 
-        // 占有セル数が変わった（端末リサイズ等）ときだけ全消去して前フレームの余分なセルを掃除する。
-        // 通常は同寸法なので消さず、下で新セルをその場に上書きする。毎フレーム 2J で全消去すると、
-        // 消去〜新画像到着までの間に画面が空白になり点滅する（特に SSH+tmux 越しは転送が遅い）。
+        // Only when the cell footprint changes (terminal resize etc.) do we clear the whole screen
+        // to sweep away the previous frame's extra cells. Normally the size is the same, so we don't
+        // clear and instead overwrite the new cells in place below. Clearing the whole screen with
+        // 2J every frame would leave the screen blank between erasing and the new image arriving,
+        // causing flicker (transfer is especially slow over SSH+tmux).
         if *self.last_footprint.borrow() != Some((cols, rows)) {
             out.write_all(b"\x1b[2J\x1b[H")?;
         }
 
-        // 新フレームを旧フレームとは別 ID で仮想配置（U=1）として転送。旧画像は表示したままなので
-        // 転送中に画面が消えない。c/r が画像の占有セル数。i は自インスタンス固有 ID。
+        // Transfer the new frame as a virtual placement (U=1) under a different ID than the old
+        // frame. The old image stays displayed, so the screen doesn't go blank during transfer.
+        // c/r is the image's cell footprint. i is the instance-unique ID.
         self.transmit(
             out,
             rgba,
             &format!("a=T,q=2,U=1,i={new_id},f=32,s={w},v={h},c={cols},r={rows}"),
         )?;
 
-        // プレースホルダセルを新 ID の色（id = r<<16 | g<<8 | b）で描き直す。前フレームのセルをその場に
-        // 上書きするので空白が生じない（消去せず差し替えるだけ）。
+        // Redraw the placeholder cells in the new ID's color (id = r<<16 | g<<8 | b). We overwrite
+        // the previous frame's cells in place, so no blank appears (we just replace, not erase).
         let (r, g, b) = ((new_id >> 16) & 0xff, (new_id >> 8) & 0xff, new_id & 0xff);
         write!(out, "\x1b[38;2;{r};{g};{b}m")?;
         let mut buf = [0u8; 4];
         for y in 0..rows {
-            // 行頭へ（tmux ではペイン相対のカーソル移動）。
+            // To the start of the line (in tmux this is pane-relative cursor movement).
             write!(out, "\x1b[{};1H", y + 1)?;
             for x in 0..cols {
                 out.write_all(PLACEHOLDER.encode_utf8(&mut buf).as_bytes())?;
@@ -194,9 +208,10 @@ impl KittyBackend {
         }
         out.write_all(b"\x1b[0m")?;
 
-        // 旧画像とその placement を解放する（d=I,i=旧ID）。新セルはもう旧 ID を参照しないので見た目に
-        // 影響しない。これで端末側に溜まる画像は常に1〜2枚に収まり、copy mode のキャレット連打など
-        // で再描画を繰り返してもメモリが膨張して端末が落ちることはない。
+        // Free the old image and its placement (d=I,i=oldID). The new cells no longer reference the
+        // old ID, so this doesn't affect the appearance. This keeps the images held on the terminal
+        // side at always 1-2, so even repeated redraws (e.g. mashing the caret in copy mode) won't
+        // balloon memory and crash the terminal.
         if let Some(old_id) = old {
             if old_id != new_id {
                 self.delete_id(out, old_id)?;
@@ -222,7 +237,8 @@ impl OutputBackend for KittyBackend {
     }
 
     fn enter(&self) -> Result<()> {
-        // 代替スクリーンへ切替 + カーソル非表示。終了時に元の画面が復元され、描画内容は残らない。
+        // Switch to the alternate screen + hide the cursor. On exit, the original screen is restored
+        // and nothing drawn remains.
         let mut out = std::io::stdout().lock();
         out.write_all(b"\x1b[?1049h\x1b[?25l")?;
         out.flush()?;
@@ -231,8 +247,9 @@ impl OutputBackend for KittyBackend {
 
     fn leave(&self) -> Result<()> {
         let mut out = std::io::stdout().lock();
-        // 転送済みの自分の画像（2バッファとも）を削除してから、カーソル表示・代替スクリーン解除。
-        // 自 ID だけ消すので別ウィンドウの別 vecview の画像は残る。
+        // Delete our own already-transferred images (both buffers), then show the cursor and leave
+        // the alternate screen. We only delete our own IDs, so another vecview's images in another
+        // window remain.
         self.delete_own(&mut out)?;
         out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1049l")?;
         out.flush()?;
@@ -240,14 +257,14 @@ impl OutputBackend for KittyBackend {
     }
 
     fn clear(&self) -> Result<()> {
-        // 画面クリアだけでは Kitty 画像が残るため、先に自分の画像（2バッファとも）を削除する
-        // （他インスタンスは温存）。
+        // Clearing the screen alone leaves Kitty images behind, so first delete our own images
+        // (both buffers) while preserving other instances'.
         let mut out = std::io::stdout().lock();
         self.delete_own(&mut out)?;
         out.write_all(b"\x1b[2J\x1b[H")?;
         out.flush()?;
-        // 画像を消したのでダブルバッファ状態をリセットし、次の display にクリーンな全消去＋再描画
-        // をさせる（残セルや解放済み ID への参照を残さない）。
+        // Since we deleted the images, reset the double-buffer state so the next display performs a
+        // clean full-clear + redraw (leaving no leftover cells or references to freed IDs).
         *self.live.borrow_mut() = None;
         *self.last_footprint.borrow_mut() = None;
         Ok(())
@@ -266,8 +283,8 @@ impl OutputBackend for KittyBackend {
     }
 }
 
-/// 画像が占有すべきセル数（列・行）を端末のセルサイズから求める。diacritics 表のサイズと
-/// 端末のセル数で上限を切る。
+/// Computes the number of cells (columns/rows) the image should occupy from the terminal's cell
+/// size. Caps it by the size of the diacritics table and the terminal's cell count.
 fn cell_footprint(w: u32, h: u32) -> (u32, u32) {
     let (cell_w, cell_h, max_cols, max_rows) = match crossterm::terminal::window_size() {
         Ok(ws) if ws.width > 0 && ws.height > 0 && ws.columns > 0 && ws.rows > 0 => (
@@ -290,14 +307,14 @@ fn cell_footprint(w: u32, h: u32) -> (u32, u32) {
     (cols, rows)
 }
 
-/// n 番目の row/column diacritic を返す（範囲外は末尾にクランプ）。
+/// Returns the n-th row/column diacritic (out-of-range values are clamped to the last).
 fn diacritic(n: u32) -> char {
     let idx = (n as usize).min(DIACRITICS.len() - 1);
     char::from_u32(DIACRITICS[idx]).unwrap_or('\u{0305}')
 }
 
-/// Kitty の row/column diacritics 表（`gen/rowcolumn-diacritics.txt`）。N 番目の diacritic が
-/// 値 N（行番号・列番号）を表す。
+/// Kitty's row/column diacritics table (`gen/rowcolumn-diacritics.txt`). The N-th diacritic
+/// represents the value N (row/column number).
 const DIACRITICS: [u32; 297] = [
     0x0305, 0x030D, 0x030E, 0x0310, 0x0312, 0x033D, 0x033E, 0x033F, 0x0346, 0x034A, 0x034B, 0x034C,
     0x0350, 0x0351, 0x0352, 0x0357, 0x035B, 0x0363, 0x0364, 0x0365, 0x0366, 0x0367, 0x0368, 0x0369,

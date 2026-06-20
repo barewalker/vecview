@@ -1,32 +1,32 @@
---- vv.nvim — nvim 内に SVG / Typst / PDF のライブプレビューを出す（純 Lua・第三者依存なし）。
+--- vv.nvim — live preview of SVG / Typst / PDF inside nvim (pure Lua, no third-party dependencies).
 ---
---- フローティング窓を開き、`vv --render` でその窓サイズの PNG を作って Kitty graphics で重ねる。
---- `.typ` は保存（BufWritePost）のたびに再描画＝ライブプレビュー。表示層は term.lua（外側端末へ
---- 直接 kitty 描画）で、image.nvim 等の外部プラグインには依存しない。
+--- Opens a floating window, renders a PNG at that window's size with `vv --render`, and overlays it via Kitty graphics.
+--- `.typ` files are re-rendered on every save (BufWritePost), i.e. live preview. The display layer is term.lua
+--- (drawing kitty graphics directly to the outer terminal) and does not depend on external plugins like image.nvim.
 ---
---- 前提: PATH に `vv`、端末が Kitty graphics 対応（Ghostty / kitty）。tmux なら allow-passthrough on。
+--- Prerequisites: `vv` on PATH, a terminal with Kitty graphics support (Ghostty / kitty). Under tmux, allow-passthrough on.
 
 local term = require("vv.term")
 
 local M = {}
 
 local config = {
-	-- 端末セルのピクセル寸法。描画解像度の目安に使う（kitty が c×r セルへ再スケールするので
-	-- 厳密でなくてよい＝シャープさだけに効く）。vv の VECVIEW_CELL_PX と同じ考え方。
+	-- Pixel dimensions of a terminal cell. Used as a guide for render resolution (kitty rescales to c×r cells,
+	-- so it need not be exact; it only affects sharpness). Same idea as vv's VECVIEW_CELL_PX.
 	cell_width = 10,
 	cell_height = 20,
-	width = 0.5, -- フロート幅（エディタ全幅に対する割合）。右側に縦長で出す。
-	vv = "vv", -- vv 実行ファイル名（PATH 上）。
+	width = 0.5, -- Float width (as a fraction of the full editor width). Shown tall on the right side.
+	vv = "vv", -- vv executable name (on PATH).
 }
 
 local state = {
 	win = nil,
 	buf = nil,
-	file = nil, -- 絶対パス
+	file = nil, -- absolute path
 	page = 1,
 	zoom = 100,
 	png = nil,
-	image_id = 0xB00B, -- このプラグイン固有の画像 ID。
+	image_id = 0xB00B, -- Image ID unique to this plugin.
 	rendering = false,
 }
 
@@ -36,13 +36,13 @@ local function is_open()
 	return state.win ~= nil and vim.api.nvim_win_is_valid(state.win)
 end
 
--- フロート内容矩形：スクリーン1始まりセル (row,col) と セル数 (cols,rows)。border=none 前提。
+-- Float content rectangle: 1-based screen cell (row,col) and cell counts (cols,rows). Assumes border=none.
 local function geom()
 	local pos = vim.api.nvim_win_get_position(state.win)
 	return pos[1] + 1, pos[2] + 1, vim.api.nvim_win_get_width(state.win), vim.api.nvim_win_get_height(state.win)
 end
 
--- 現在ページを vv --render で PNG 化し、フロートへ Kitty 描画する。
+-- Render the current page to a PNG with vv --render and draw it into the float via Kitty.
 function M.render()
 	if not is_open() or not state.file or state.rendering then
 		return
@@ -69,14 +69,14 @@ function M.render()
 		vim.schedule(function()
 			state.rendering = false
 			if res.code ~= 0 then
-				vim.notify("vv --render 失敗:\n" .. (res.stderr or ""), vim.log.levels.ERROR)
+				vim.notify("vv --render failed:\n" .. (res.stderr or ""), vim.log.levels.ERROR)
 				return
 			end
 			if not is_open() then
 				return
 			end
-			-- 旧フレームを消してから新フレームを描く（同 ID の placement 累積を防ぐ）。保存毎の
-			-- 低頻度更新なので一瞬の切り替えは許容。
+			-- Clear the old frame before drawing the new one (prevents placements piling up under the same ID). Since
+			-- updates are infrequent (once per save), a brief flicker during the swap is acceptable.
 			term.clear(state.image_id)
 			local row, col, c, r = geom()
 			term.show(state.png, state.image_id, row, col, c, r)
@@ -86,7 +86,7 @@ end
 
 local function setup_autocmds()
 	local grp = vim.api.nvim_create_augroup("VvPreview", { clear = true })
-	-- ソース保存で再描画（Typst ライブプレビュー）。
+	-- Re-render when the source is saved (Typst live preview).
 	vim.api.nvim_create_autocmd("BufWritePost", {
 		group = grp,
 		callback = function(ev)
@@ -95,7 +95,7 @@ local function setup_autocmds()
 			end
 		end,
 	})
-	-- リサイズ/レイアウト変化で描き直す。
+	-- Redraw on resize / layout change.
 	vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, {
 		group = grp,
 		callback = function()
@@ -104,7 +104,7 @@ local function setup_autocmds()
 			end
 		end,
 	})
-	-- フロートが閉じたら画像を消す。
+	-- Clear the image when the float is closed.
 	vim.api.nvim_create_autocmd("WinClosed", {
 		group = grp,
 		callback = function(ev)
@@ -114,7 +114,7 @@ local function setup_autocmds()
 			end
 		end,
 	})
-	-- 終了時に画像を端末へ残さない。
+	-- Do not leave the image on the terminal on exit.
 	vim.api.nvim_create_autocmd("VimLeavePre", {
 		group = grp,
 		callback = function()
@@ -123,20 +123,20 @@ local function setup_autocmds()
 	})
 end
 
--- プレビューを開く（引数なしなら現在バッファのファイル）。
+-- Open the preview (uses the current buffer's file if no argument is given).
 function M.open(file)
 	file = file
 	if not file or file == "" then
 		file = vim.api.nvim_buf_get_name(0)
 	end
 	if not file or file == "" then
-		vim.notify("vv: 対象ファイルがありません", vim.log.levels.WARN)
+		vim.notify("vv: no target file", vim.log.levels.WARN)
 		return
 	end
 	file = vim.fn.fnamemodify(file, ":p")
 	local ext = (file:match("%.([%w]+)$") or ""):lower()
 	if not SUPPORTED[ext] then
-		vim.notify(string.format("vv: 非対応のファイル (.%s)。svg / typ / pdf のみ。", ext), vim.log.levels.WARN)
+		vim.notify(string.format("vv: unsupported file (.%s). svg / typ / pdf only.", ext), vim.log.levels.WARN)
 		return
 	end
 
@@ -160,7 +160,7 @@ function M.open(file)
 			border = "none",
 			focusable = false,
 		})
-		-- 末尾 '~' を消し、空セルが画像を邪魔しないようにする。
+		-- Remove the trailing '~' so empty cells don't interfere with the image.
 		vim.wo[state.win].fillchars = "eob: "
 		setup_autocmds()
 	end
@@ -206,7 +206,7 @@ function M.zoom_out()
 	M.render()
 end
 
--- 画像が他の描画で消された/ずれたときに手動で描き直す。
+-- Manually redraw when the image has been erased or displaced by other rendering.
 function M.refresh()
 	M.render()
 end
@@ -216,12 +216,12 @@ function M.setup(opts)
 	local cmd = vim.api.nvim_create_user_command
 	cmd("VV", function(a)
 		M.open(a.args ~= "" and a.args or nil)
-	end, { nargs = "?", complete = "file", desc = "vecview: プレビューを開く" })
-	cmd("VVClose", M.close, { desc = "vecview: プレビューを閉じる" })
-	cmd("VVToggle", M.toggle, { desc = "vecview: プレビュー開閉" })
-	cmd("VVNext", M.next_page, { desc = "vecview: 次ページ" })
-	cmd("VVPrev", M.prev_page, { desc = "vecview: 前ページ" })
-	cmd("VVRefresh", M.refresh, { desc = "vecview: 再描画" })
+	end, { nargs = "?", complete = "file", desc = "vecview: open preview" })
+	cmd("VVClose", M.close, { desc = "vecview: close preview" })
+	cmd("VVToggle", M.toggle, { desc = "vecview: toggle preview" })
+	cmd("VVNext", M.next_page, { desc = "vecview: next page" })
+	cmd("VVPrev", M.prev_page, { desc = "vecview: previous page" })
+	cmd("VVRefresh", M.refresh, { desc = "vecview: redraw" })
 end
 
 return M
