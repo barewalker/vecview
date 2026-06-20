@@ -15,6 +15,9 @@ edition = "2021"
 authors = ["Mitsuaki Takeuchi"]
 license = "Apache-2.0"
 repository = "https://github.com/barewalker/vecview"
+homepage = "https://github.com/barewalker/vecview"
+keywords = ["terminal", "svg", "typst", "pdf", "preview"]
+categories = ["command-line-utilities", "visualization"]
 
 [workspace.dependencies]
 # Core

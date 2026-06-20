@@ -2,9 +2,15 @@
 name = "vecview-output"
 version.workspace = true
 edition.workspace = true
+description = "Output backends for vecview: Kitty graphics, Sixel, and Linux framebuffer."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-vecview-core = { path = "../vecview-core" }
+vecview-core = { path = "../vecview-core", version = "0.1.0" }
 crossterm.workspace = true
 base64.workspace = true
 flate2 = "1"

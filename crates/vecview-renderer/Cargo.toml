@@ -2,9 +2,15 @@
 name = "vecview-renderer"
 version.workspace = true
 edition.workspace = true
+description = "Headless GPU renderer for vecview: lyon tessellation + wgpu, with RGBA readback."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-vecview-core = { path = "../vecview-core" }
+vecview-core = { path = "../vecview-core", version = "0.1.0" }
 lyon.workspace = true
 wgpu.workspace = true
 pollster.workspace = true

@@ -2,9 +2,15 @@
 name = "vecview-svg"
 version.workspace = true
 edition.workspace = true
+description = "SVG parsing (via usvg) into vecview's Page representation, preserving curves."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-vecview-core = { path = "../vecview-core" }
+vecview-core = { path = "../vecview-core", version = "0.1.0" }
 usvg.workspace = true
 image = "0.25"
 regex = "1"

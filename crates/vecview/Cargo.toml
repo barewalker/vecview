@@ -2,6 +2,13 @@
 name = "vecview"
 version.workspace = true
 edition.workspace = true
+description = "Display vector graphics (SVG / Typst / PDF) in your terminal at full vector quality. Installs the `vv` command."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 # The package (full name) stays vecview; the installed command is the short vv.
 [[bin]]
@@ -9,11 +16,11 @@ name = "vv"
 path = "src/main.rs"
 
 [dependencies]
-vecview-core = { path = "../vecview-core" }
-vecview-pdf = { path = "../vecview-pdf" }
-vecview-svg = { path = "../vecview-svg" }
-vecview-renderer = { path = "../vecview-renderer" }
-vecview-output = { path = "../vecview-output" }
+vecview-core = { path = "../vecview-core", version = "0.1.0" }
+vecview-pdf = { path = "../vecview-pdf", version = "0.1.0" }
+vecview-svg = { path = "../vecview-svg", version = "0.1.0" }
+vecview-renderer = { path = "../vecview-renderer", version = "0.1.0" }
+vecview-output = { path = "../vecview-output", version = "0.1.0" }
 clap.workspace = true
 anyhow.workspace = true
 notify.workspace = true

@@ -2,6 +2,12 @@
 name = "vecview-core"
 version.workspace = true
 edition.workspace = true
+description = "Format-independent core abstractions (Document, Page, PathData, OutputBackend) for vecview."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 anyhow.workspace = true
