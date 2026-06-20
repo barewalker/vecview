@@ -2,6 +2,7 @@
 name = "vecview-output"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 description = "Output backends for vecview: Kitty graphics, Sixel, and Linux framebuffer."
 license.workspace = true
 repository.workspace = true

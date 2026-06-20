@@ -2,6 +2,7 @@
 name = "vecview-pdf"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 description = "Direct PDF rasterization and text-layer extraction via pdfium, for vecview."
 license.workspace = true
 repository.workspace = true

@@ -2,6 +2,7 @@
 name = "vecview"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 description = "Display vector graphics (SVG / Typst / PDF) in your terminal at full vector quality. Installs the `vv` command."
 license.workspace = true
 repository.workspace = true

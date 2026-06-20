@@ -2,6 +2,7 @@
 name = "vecview-renderer"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 description = "Headless GPU renderer for vecview: lyon tessellation + wgpu, with RGBA readback."
 license.workspace = true
 repository.workspace = true
