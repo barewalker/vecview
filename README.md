@@ -188,6 +188,7 @@ set -as terminal-features '*:sixel'
 | `VECVIEW_CELL_PX` | `8x16` | Approximate cell size `WxH` when the terminal doesn't report pixel dimensions (SSH+tmux, etc.). Adjust if the display shrinks or overflows |
 | `VECVIEW_MIN_FRAME_MS` | `200` (over tmux) / `80` (direct) | Minimum interval (ms) between image transfers during continuous input. Smaller is smoother but becomes unstable if it outruns the terminal |
 | `VECVIEW_REDRAW_MS` | `1000` | Resend interval (ms) to restore tmux passthrough sixel after a tmux redraw |
+| `VECVIEW_VIS_POLL_MS` | `1000` | Interval (ms) for polling tmux window visibility (kitty placeholder path). Each tick spawns a `tmux` subprocess, so a shorter value raises idle CPU; `0` disables polling (the image may linger in another window when you switch away) |
 | `VECVIEW_SIXEL_NATIVE` | off | `1` to attempt tmux native sixel (requires sixel in `client_termfeatures`) |
 | `VECVIEW_PROBE` | off | `1` to print the size reported by the terminal and the render resolution, then exit (for resolution debugging) |
 

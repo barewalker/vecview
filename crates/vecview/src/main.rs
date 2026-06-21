@@ -424,9 +424,11 @@ fn main() -> Result<()> {
     // foreground window's pane, because the terminal doesn't clip images per tmux window. Poll
     // periodically whether our own window is visible; clear the image when hidden and redraw when
     // it returns. Visibility is judged via $TMUX_PANE's window_active.
+    // The interval is VECVIEW_VIS_POLL_MS (default 1000ms, minimum 100ms); 0 disables polling
+    // entirely (each tick spawns a `tmux` subprocess, so a short interval costs CPU even at idle).
     let kitty_ph = backend.name().contains("placeholder");
     let vis_pane = std::env::var("TMUX_PANE").ok();
-    let vis_poll = Duration::from_millis(250);
+    let vis_poll = vis_poll_ms().map(Duration::from_millis);
     let mut last_vis_poll = Instant::now();
     let mut was_visible = true;
 
@@ -435,14 +437,20 @@ fn main() -> Result<()> {
         // and the deadline of a pending draw that's being throttled.
         let wait = {
             let mut w = refresh;
-            if pending_full || pending_overlay {
+            // A pending draw contributes its (throttled) deadline only when we could actually draw
+            // it. While our tmux window is hidden, drawing is suppressed (see the draw decision),
+            // so the pending flag must NOT drive the wait toward zero — otherwise the deadline is
+            // perpetually "now", recv_timeout(0) returns immediately, and the loop spins a full
+            // core until the window returns. When hidden, only the visibility poll (below) wakes us.
+            let can_attempt_draw = !kitty_ph || was_visible;
+            if (pending_full || pending_overlay) && can_attempt_draw {
                 let remaining = last_draw
                     .map(|t| min_frame.saturating_sub(Instant::now().duration_since(t)))
                     .unwrap_or(Duration::ZERO);
                 w = Some(w.map_or(remaining, |x| x.min(remaining)));
             }
-            if kitty_ph && vis_pane.is_some() {
-                let remaining = vis_poll.saturating_sub(Instant::now().duration_since(last_vis_poll));
+            if let (true, Some(vp)) = (kitty_ph && vis_pane.is_some(), vis_poll) {
+                let remaining = vp.saturating_sub(Instant::now().duration_since(last_vis_poll));
                 w = Some(w.map_or(remaining, |x| x.min(remaining)));
             }
             w
@@ -730,10 +738,10 @@ fn main() -> Result<()> {
 
         // Visibility polling (countering cross-window lingering of tmux placeholder). Clear the
         // image when hidden, redraw when it returns.
-        if kitty_ph {
+        if let (true, Some(vp)) = (kitty_ph, vis_poll) {
             if let Some(pane) = vis_pane.as_deref() {
                 let now = Instant::now();
-                if now.duration_since(last_vis_poll) >= vis_poll {
+                if now.duration_since(last_vis_poll) >= vp {
                     last_vis_poll = now;
                     if let Some(visible) = pane_window_active(pane) {
                         if !visible && was_visible {
@@ -1934,6 +1942,22 @@ fn redraw_interval_ms() -> u64 {
         .and_then(|s| s.parse::<u64>().ok())
         .map(|v| v.max(100))
         .unwrap_or(1000)
+}
+
+/// The visibility-polling interval (ms) for the tmux placeholder path. We spawn `tmux
+/// display-message` each tick to detect whether our window is active, so a short interval keeps a
+/// subprocess firing several times a second even while idle (noticeable CPU). Overridden by
+/// `VECVIEW_VIS_POLL_MS`, default 1000, minimum 100. Set to 0 to disable visibility polling
+/// entirely (the image may linger in another tmux window when you switch away).
+fn vis_poll_ms() -> Option<u64> {
+    match std::env::var("VECVIEW_VIS_POLL_MS") {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(v) => Some(v.max(100)),
+            Err(_) => Some(1000),
+        },
+        Err(_) => Some(1000),
+    }
 }
 
 /// Parse "WxH" (separator `x` or `X`) into (width, height). Each value is clamped to 1..=128.
