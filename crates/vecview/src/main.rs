@@ -421,11 +421,14 @@ fn main() -> Result<()> {
     let mut last_sixel = Instant::now(); // Previous time of the periodic sixel redraw.
 
     // With tmux placeholder kitty, switching to another window leaves the image stuck in the
-    // foreground window's pane, because the terminal doesn't clip images per tmux window. Poll
-    // periodically whether our own window is visible; clear the image when hidden and redraw when
-    // it returns. Visibility is judged via $TMUX_PANE's window_active.
-    // The interval is VECVIEW_VIS_POLL_MS (default 1000ms, minimum 100ms); 0 disables polling
-    // entirely (each tick spawns a `tmux` subprocess, so a short interval costs CPU even at idle).
+    // foreground window's pane, because the terminal doesn't clip images per tmux window. Optionally
+    // poll whether our own window is visible (via $TMUX_PANE's window_active) and clear the image
+    // when hidden / redraw when it returns.
+    //
+    // This polling is OFF by default: each tick runs `tmux display-message`, and that query makes
+    // tmux refresh the client, which forces the terminal (Ghostty) to recomposite the large
+    // placeholder image — pinning a CPU core even while idle. Enable it with VECVIEW_VIS_POLL_MS=<ms>
+    // only if the lingering-image-on-window-switch bothers you and your terminal tolerates it.
     let kitty_ph = backend.name().contains("placeholder");
     let vis_pane = std::env::var("TMUX_PANE").ok();
     let vis_poll = vis_poll_ms().map(Duration::from_millis);
@@ -1944,19 +1947,19 @@ fn redraw_interval_ms() -> u64 {
         .unwrap_or(1000)
 }
 
-/// The visibility-polling interval (ms) for the tmux placeholder path. We spawn `tmux
-/// display-message` each tick to detect whether our window is active, so a short interval keeps a
-/// subprocess firing several times a second even while idle (noticeable CPU). Overridden by
-/// `VECVIEW_VIS_POLL_MS`, default 1000, minimum 100. Set to 0 to disable visibility polling
-/// entirely (the image may linger in another tmux window when you switch away).
+/// The visibility-polling interval (ms) for the tmux placeholder path. OFF by default: each tick
+/// spawns `tmux display-message` to detect whether our window is active, and that query makes tmux
+/// refresh the client (forcing the terminal to recomposite the large placeholder image), which pins
+/// a CPU core even while idle. Enable with `VECVIEW_VIS_POLL_MS=<ms>` (minimum 100) only if the
+/// lingering image when you switch tmux windows bothers you and your terminal tolerates the redraw.
 fn vis_poll_ms() -> Option<u64> {
     match std::env::var("VECVIEW_VIS_POLL_MS") {
         Ok(s) => match s.trim().parse::<u64>() {
             Ok(0) => None,
             Ok(v) => Some(v.max(100)),
-            Err(_) => Some(1000),
+            Err(_) => None,
         },
-        Err(_) => Some(1000),
+        Err(_) => None,
     }
 }
 
