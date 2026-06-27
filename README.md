@@ -18,9 +18,9 @@ raster** and hand that bitmap to the terminal — so zooming in just scales a
 bitmap and gets blurry. vecview is a **renderer, not a bitmap viewer**:
 
 - **Re-rasterized vector quality.** SVG/Typst/Markdown are re-tessellated and
-  re-rendered (GPU, MSAA) at the *current* zoom every time, so the image stays
-  crisp no matter how far you magnify. PDFs are re-rasterized per viewport by
-  pdfium for the same effect.
+  re-rendered (GPU, MSAA + supersampling) at the *current* zoom every time, so the
+  image stays crisp no matter how far you magnify. PDFs are re-rasterized per
+  viewport by pdfium for the same effect.
 - **Typst & Markdown live preview, in-terminal.** Edit in nvim, save, and the
   preview updates — no browser, no separate render step. Terminal-completed Typst
   live preview is essentially unique to vecview.
@@ -205,8 +205,9 @@ set -as terminal-features '*:sixel'
 | Variable | Default | Description |
 |---|---|---|
 | `VECVIEW_BACKEND` | auto-detect | Force a backend `[kitty\|tmux\|sixel\|framebuffer]` |
-| `VECVIEW_SCALE` | `1` | Supersampling factor (1..=4). Also settable with `-s`. Higher is sharper but transfer size grows with the square of the factor |
-| `VECVIEW_CELL_PX` | `8x16` | Approximate cell size `WxH` when the terminal doesn't report pixel dimensions (SSH+tmux, etc.). Adjust if the display shrinks or overflows |
+| `VECVIEW_AA_SS` | `2` | Internal supersampling for SVG/Typst/Markdown anti-aliasing (1..=4). The scene is rendered at this multiple and downsampled back, sharpening text/curve edges **without** enlarging the transferred image. `1` disables it (faster, but jaggier). Independent of `-s` |
+| `VECVIEW_SCALE` | `1` | Transfer-resolution supersampling factor (1..=4). Also settable with `-s`. Sends a larger image for the terminal to downscale; sharper but transfer size grows with the square of the factor (can destabilize tmux/sixel) |
+| `VECVIEW_CELL_PX` | auto | Manual override of the terminal cell size `WxH`. Normally auto-detected (`TIOCGWINSZ`, or a `CSI 16t` query that works through tmux); set this only if detection is wrong or unavailable |
 | `VECVIEW_MIN_FRAME_MS` | `200` (over tmux) / `80` (direct) | Minimum interval (ms) between image transfers during continuous input. Smaller is smoother but becomes unstable if it outruns the terminal |
 | `VECVIEW_REDRAW_MS` | `1000` | Resend interval (ms) to restore tmux passthrough sixel after a tmux redraw |
 | `VECVIEW_VIS_POLL_MS` | `0` (off) | Interval (ms) for polling tmux window visibility (kitty placeholder path). Off by default because each tick spawns a `tmux` subprocess that makes tmux refresh the client — pinning a CPU core even while idle. Set `>0` only if you want the image cleared when switching tmux windows and your terminal tolerates the redraw |
