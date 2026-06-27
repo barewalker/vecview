@@ -225,6 +225,11 @@ struct Args {
     /// Page to render (1-based). Only valid with `--render` (default 1).
     #[arg(long, default_value_t = 1)]
     page: usize,
+
+    /// Export the document to PDF and exit (Typst / Markdown only). Output goes to `--output`, or
+    /// `<file>.pdf` next to the source by default.
+    #[arg(long)]
+    pdf: bool,
 }
 
 fn main() -> Result<()> {
@@ -259,6 +264,17 @@ fn main() -> Result<()> {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+
+    // PDF export mode (--pdf): compile Typst/Markdown to PDF and exit, no terminal/interaction.
+    if args.pdf {
+        let out = match args.output.as_deref() {
+            Some(o) if o != "-" => PathBuf::from(o),
+            _ => args.file.with_extension("pdf"),
+        };
+        export_to_pdf(&args.file, &ext, &out)?;
+        eprintln!("vecview: exported PDF -> {}", out.display());
+        return Ok(());
+    }
 
     // PDF is drawn directly with pdfium (the pdftocairo->SVG->usvg path shifts figures due to a
     // double-application-of-transform bug on nested <use>). The opened document is kept here.
@@ -567,6 +583,19 @@ fn main() -> Result<()> {
                                 Err(e) => state.status = Some(format!("text layer error: {e:#}")),
                             }
                             dirty = true;
+                        }
+                        Some(Action::ExportPdf) => {
+                            let out = args.file.with_extension("pdf");
+                            match export_to_pdf(&args.file, &ext, &out) {
+                                Ok(()) => {
+                                    state.status =
+                                        Some(format!("exported PDF -> {}", out.display()))
+                                }
+                                Err(e) => {
+                                    state.status = Some(format!("PDF export failed: {e:#}"))
+                                }
+                            }
+                            overlay_only = true;
                         }
                         Some(action) => {
                             apply_action(action, pages, &mut state);
@@ -986,6 +1015,8 @@ enum Action {
     ToggleHelp,
     /// Enter text selection (copy mode).
     EnterCopyMode,
+    /// Export the current document to PDF (Typst / Markdown only).
+    ExportPdf,
 }
 
 /// Zoom factor (%). The minimum is fit (100), the maximum is 16x.
@@ -1010,6 +1041,7 @@ const ACTIONS: &[(&str, Action, &[&str])] = &[
     ("first_page", Action::FirstPage, &["h"]),
     ("last_page", Action::LastPage, &["l"]),
     ("copy_mode", Action::EnterCopyMode, &["y"]),
+    ("export_pdf", Action::ExportPdf, &["e"]),
     ("help", Action::ToggleHelp, &["?"]),
     ("quit", Action::Quit, &["q", "esc", "ctrl+c"]),
 ];
@@ -1180,9 +1212,11 @@ fn apply_action(action: Action, pages: usize, state: &mut ViewState) {
         // The content bbox is only known at draw time (the page must be read), so just raise the
         // request and reflect it into zoom/center at draw time (render_pdf / render_and_display).
         Action::FitContent(fit) => state.pending_fit = Some(fit),
-        // Help and copy mode are handled in the main loop (their draw/input paths differ from normal display).
+        // Help, copy mode, and PDF export are handled in the main loop (their draw/input paths
+        // differ from normal display).
         Action::ToggleHelp => {}
         Action::EnterCopyMode => {}
+        Action::ExportPdf => {}
     }
 }
 
@@ -1930,6 +1964,57 @@ fn spawn_markdown_watch(md: &Path) -> Result<(Source, Child)> {
         .context("failed to launch typst watch (markdown)")?;
 
     Ok((Source::Typst { dir, stem, tag }, child))
+}
+
+/// Export a Typst or Markdown document to PDF via `typst compile`. Markdown is wrapped with the
+/// cmarker package (same as the live preview) and compiled with `--root /`. stderr is captured (not
+/// inherited) so this is safe to call while the interactive display is active.
+fn export_to_pdf(file: &Path, ext: &str, out: &Path) -> Result<()> {
+    if which_typst().is_none() {
+        bail!("typst is not on PATH. PDF export requires typst.");
+    }
+    match ext {
+        "typ" => typst_compile_pdf(file, None, out),
+        "md" | "markdown" => {
+            let dir = std::env::temp_dir();
+            let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("vv");
+            let tag = std::process::id();
+            let wrapper = dir.join(format!("vv-export-{stem}-{tag}.typ"));
+            std::fs::write(&wrapper, cmarker_wrapper_src(file)?)
+                .context("failed to write markdown wrapper")?;
+            let r = typst_compile_pdf(&wrapper, Some("/"), out);
+            let _ = std::fs::remove_file(&wrapper);
+            r
+        }
+        other => bail!("PDF export supports only .typ and .md/.markdown (not .{other})"),
+    }
+}
+
+/// Run `typst compile <main> <out> --format pdf` (optional `--root`), capturing stderr so it never
+/// leaks onto the terminal; a compile error is surfaced via the returned `Err`.
+fn typst_compile_pdf(main: &Path, root: Option<&str>, out: &Path) -> Result<()> {
+    let mut cmd = Command::new("typst");
+    cmd.arg("compile");
+    if let Some(r) = root {
+        cmd.arg("--root").arg(r);
+    }
+    let output = cmd
+        .arg(main)
+        .arg(out)
+        .arg("--format")
+        .arg("pdf")
+        .output()
+        .context("failed to launch typst compile (pdf)")?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        let detail = err
+            .lines()
+            .find(|l| l.to_lowercase().contains("error"))
+            .unwrap_or_else(|| err.lines().next().unwrap_or(""))
+            .trim();
+        bail!("typst PDF compile failed: {detail}");
+    }
+    Ok(())
 }
 
 fn mtime_of(path: &Path) -> Option<SystemTime> {

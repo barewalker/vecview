@@ -76,6 +76,9 @@ vv notes.md          # render Markdown via Typst (cmarker); live-redraws on ever
 vv paper.pdf         # display a PDF (watches the file for changes and redraws)
 vv diagram.svg       # display an SVG (also usable as a general-purpose SVG viewer)
 
+# Export Typst / Markdown to PDF (no display), then exit
+vv --pdf notes.md            # -> notes.pdf  (or `-o out.pdf` for a custom path)
+
 # Options
 vv doc.typ -z 150            # initial zoom 150%
 vv doc.typ -s 2              # supersampling factor (default 1)
@@ -117,6 +120,7 @@ vv --render paper.pdf --size 700x900 --page 3 -o -    # send page 3 to stdout
 | `h` / `l` | First / last page |
 | Mouse wheel | Page navigation (down = next / up = previous) |
 | `y` | Enter text selection (copy mode) |
+| `e` | Export to PDF (Typst / Markdown only) → `<file>.pdf` |
 | `?` | Show help |
 | `q` / `Esc` / `Ctrl-C` | Quit |
 
