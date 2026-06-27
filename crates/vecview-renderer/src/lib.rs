@@ -19,6 +19,52 @@ use wgpu::util::DeviceExt;
 const SAMPLE_COUNT: u32 = 4;
 const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
+/// Internal supersampling factor for anti-aliasing: the vector scene is rendered at this integer
+/// multiple of the requested size and then box-downsampled back down, sharpening text/curve edges
+/// to roughly pdfium quality WITHOUT enlarging the transferred image. MSAA alone (4x) only gives a
+/// few coverage levels on edges; supersampling effectively yields `(ss*ss * SAMPLE_COUNT)` levels.
+/// Override with `VECVIEW_AA_SS` (1 disables; clamped to 1..=4). Combines on top of `-s`/VECVIEW_SCALE.
+fn aa_supersample() -> u32 {
+    use std::sync::OnceLock;
+    static SS: OnceLock<u32> = OnceLock::new();
+    *SS.get_or_init(|| {
+        std::env::var("VECVIEW_AA_SS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map(|v| v.clamp(1, 4))
+            .unwrap_or(2)
+    })
+}
+
+/// Average each `ss`x`ss` block of `src` (`sw`=`dw*ss` wide) into one pixel, producing a tightly
+/// packed `dw`x`dh` RGBA buffer. This is the downsample step of internal supersampling.
+fn box_downsample(src: &[u8], sw: u32, dw: u32, dh: u32, ss: u32) -> Vec<u8> {
+    let (sw, dw, dh, ss) = (sw as usize, dw as usize, dh as usize, ss as usize);
+    let n = (ss * ss) as u32;
+    let mut dst = vec![0u8; dw * dh * 4];
+    for dy in 0..dh {
+        for dx in 0..dw {
+            let mut acc = [0u32; 4];
+            for oy in 0..ss {
+                let row = (dy * ss + oy) * sw * 4;
+                for ox in 0..ss {
+                    let i = row + (dx * ss + ox) * 4;
+                    acc[0] += src[i] as u32;
+                    acc[1] += src[i + 1] as u32;
+                    acc[2] += src[i + 2] as u32;
+                    acc[3] += src[i + 3] as u32;
+                }
+            }
+            let o = (dy * dw + dx) * 4;
+            dst[o] = (acc[0] / n) as u8;
+            dst[o + 1] = (acc[1] / n) as u8;
+            dst[o + 2] = (acc[2] / n) as u8;
+            dst[o + 3] = (acc[3] / n) as u8;
+        }
+    }
+    dst
+}
+
 /// Background color outside the page (letterbox). Kept dark as the viewer background so the page boundary is visible.
 const LETTERBOX: wgpu::Color = wgpu::Color {
     r: 0.10,
@@ -291,8 +337,20 @@ impl Renderer {
         height: u32,
         viewport: [f32; 4],
     ) -> Result<Vec<u8>> {
-        let width = width.max(1);
-        let height = height.max(1);
+        let target_w = width.max(1);
+        let target_h = height.max(1);
+
+        // Internal supersampling: render at an integer multiple, then box-downsample to the
+        // requested size before returning (sharper edges, same transferred size). Reduce the factor
+        // if the supersampled texture would exceed the GPU's max 2D dimension.
+        let max_dim = self.device.limits().max_texture_dimension_2d.max(1);
+        let mut ss = aa_supersample();
+        while ss > 1 && (target_w.saturating_mul(ss) > max_dim || target_h.saturating_mul(ss) > max_dim)
+        {
+            ss -= 1;
+        }
+        let width = target_w * ss;
+        let height = target_h * ss;
 
         let geometry = tessellate(page)?;
 
@@ -450,6 +508,10 @@ impl Renderer {
         drop(data);
         readback.unmap();
 
+        // Downsample the supersampled render back to the requested size.
+        if ss > 1 {
+            return Ok(box_downsample(&out, width, target_w, target_h, ss));
+        }
         Ok(out)
     }
 
