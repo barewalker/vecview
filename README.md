@@ -1,14 +1,33 @@
 # vecview
 
-A CLI tool that displays vector graphics (SVG / Typst / PDF) in your terminal
-**at full vector quality, without rasterizing**. SVG and Typst are tessellated
-with `lyon` and rendered by `wgpu` (GPU), with anti-aliasing performed freshly
-at the current display resolution every time — so zooming in never degrades the
-image. PDFs are rasterized directly by `pdfium`.
+A CLI tool that displays vector documents (SVG / Typst / Markdown / PDF) in your
+terminal **at full vector quality, without rasterizing**. SVG and Typst are
+tessellated with `lyon` and rendered by `wgpu` (GPU), with anti-aliasing performed
+freshly at the current display resolution every time — so zooming in never
+degrades the image. Markdown is rendered through Typst (via the `cmarker` package)
+so it gets the same vector quality. PDFs are rasterized directly by `pdfium`.
 
-The primary goal is to **keep the live preview of Typst documents you edit in
-nvim entirely inside the terminal**. No browser required — every time you save,
-the preview in your terminal updates.
+The primary goal is to **keep the live preview of Typst (and Markdown) documents
+you edit in nvim entirely inside the terminal**. No browser required — every time
+you save, the preview in your terminal updates.
+
+## What makes it different
+
+Most terminal document/image viewers decode a file to a **fixed-resolution
+raster** and hand that bitmap to the terminal — so zooming in just scales a
+bitmap and gets blurry. vecview is a **renderer, not a bitmap viewer**:
+
+- **Re-rasterized vector quality.** SVG/Typst/Markdown are re-tessellated and
+  re-rendered (GPU, MSAA) at the *current* zoom every time, so the image stays
+  crisp no matter how far you magnify. PDFs are re-rasterized per viewport by
+  pdfium for the same effect.
+- **Typst & Markdown live preview, in-terminal.** Edit in nvim, save, and the
+  preview updates — no browser, no separate render step. Terminal-completed Typst
+  live preview is essentially unique to vecview.
+- **Multiple output protocols.** Kitty graphics, Sixel, **and the raw Linux
+  framebuffer** (`/dev/fb0`, native resolution) — not kitty-graphics-only like
+  most alternatives.
+- **Selectable text** over the rendered image (copy mode), via the PDF text layer.
 
 ## Installation
 
@@ -41,7 +60,7 @@ runtime dependencies below still need to be present regardless of how you instal
 | Dependency | Purpose | Notes |
 |---|---|---|
 | **libpdfium** (`libpdfium.so` / `.dylib` / `.dll`) | PDF rendering and the text layer for Typst/PDF | Required. Linked and loaded by `pdfium-render` |
-| **typst** | Live preview of `.typ` files | Only needed when passing a `.typ`. Must be on `PATH` |
+| **typst** | Live preview of `.typ` and `.md` files | Needed for `.typ`/`.md`. Must be on `PATH`. Markdown also uses the `cmarker` package (auto-fetched on first use; needs network once) |
 | **Vulkan driver** (Mesa RADV/ANV, etc.) | GPU rendering of SVG/Typst | Required for headless wgpu rendering |
 
 Prebuilt libpdfium binaries are available from
@@ -51,8 +70,9 @@ Place the library somewhere on your library search path (`LD_LIBRARY_PATH`, etc.
 ## Usage
 
 ```bash
-vv <FILE>            # SVG / Typst (.typ) / PDF
+vv <FILE>            # SVG / Typst (.typ) / Markdown (.md) / PDF
 vv doc.typ           # spawns `typst watch` internally and live-redraws on every save
+vv notes.md          # render Markdown via Typst (cmarker); live-redraws on every save
 vv paper.pdf         # display a PDF (watches the file for changes and redraws)
 vv diagram.svg       # display an SVG (also usable as a general-purpose SVG viewer)
 
@@ -132,7 +152,8 @@ Supported formats: **PDF** has a text layer natively. **Typst** is displayed as
 SVG (vector quality), and when you enter copy mode the same `.typ` is also
 compiled to PDF in the background, whose glyphs and coordinates drive the
 selection (Typst's SVG turns glyphs into paths and carries no text). A standalone
-`.svg` has no text layer.
+`.svg`, and Markdown (`.md`), have no text layer, so copy mode is unavailable
+there.
 
 ### Editor / file-manager integration (yazi / nvim)
 
@@ -188,7 +209,7 @@ set -as terminal-features '*:sixel'
 | `VECVIEW_CELL_PX` | `8x16` | Approximate cell size `WxH` when the terminal doesn't report pixel dimensions (SSH+tmux, etc.). Adjust if the display shrinks or overflows |
 | `VECVIEW_MIN_FRAME_MS` | `200` (over tmux) / `80` (direct) | Minimum interval (ms) between image transfers during continuous input. Smaller is smoother but becomes unstable if it outruns the terminal |
 | `VECVIEW_REDRAW_MS` | `1000` | Resend interval (ms) to restore tmux passthrough sixel after a tmux redraw |
-| `VECVIEW_VIS_POLL_MS` | `1000` | Interval (ms) for polling tmux window visibility (kitty placeholder path). Each tick spawns a `tmux` subprocess, so a shorter value raises idle CPU; `0` disables polling (the image may linger in another window when you switch away) |
+| `VECVIEW_VIS_POLL_MS` | `0` (off) | Interval (ms) for polling tmux window visibility (kitty placeholder path). Off by default because each tick spawns a `tmux` subprocess that makes tmux refresh the client — pinning a CPU core even while idle. Set `>0` only if you want the image cleared when switching tmux windows and your terminal tolerates the redraw |
 | `VECVIEW_SIXEL_NATIVE` | off | `1` to attempt tmux native sixel (requires sixel in `client_termfeatures`) |
 | `VECVIEW_PROBE` | off | `1` to print the size reported by the terminal and the render resolution, then exit (for resolution debugging) |
 
@@ -206,12 +227,13 @@ set -as terminal-features '*:sixel'
 ## Architecture
 
 ```
-.typ ──(typst watch)──┐
-                      ├─> SVG ──usvg──> vector tree ──lyon──> mesh
-.svg ─────────────────┘                                       │
-                                                              ▼
+.md  ──(cmarker wrapper)──┐
+.typ ──(typst watch)──────┤
+                          ├─> SVG ──usvg──> vector tree ──lyon──> mesh
+.svg ─────────────────────┘                                       │
+                                                                  ▼
                             wgpu (offscreen · MSAA · display resolution)──> RGBA
-.pdf ──pdfium──(viewport re-rasterize)────────────────────────> RGBA
+.pdf ──pdfium──(viewport re-rasterize)────────────────────────────> RGBA
                                                               │
                           ┌──────────────────────┬────────────┴─────────┐
                           ▼                       ▼                      ▼
@@ -241,7 +263,7 @@ Headless GPU rendering requires a Vulkan driver (Mesa RADV/ANV, etc.).
 
 ## Status and roadmap
 
-Implemented: display of SVG / Typst / PDF, live redraw on file changes, Kitty
+Implemented: display of SVG / Typst / Markdown / PDF, live redraw on file changes, Kitty
 (+ tmux placeholder) / Sixel (+ tmux) / Framebuffer output, high-resolution
 vector-quality rendering, interactive zoom and multi-page navigation, text
 selection and copy, correct placement within a tmux pane, and handling of window

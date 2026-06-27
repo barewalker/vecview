@@ -267,6 +267,10 @@ fn main() -> Result<()> {
             let (source, child) = spawn_typst_watch(&args.file)?;
             (source, Some(child))
         }
+        "md" | "markdown" => {
+            let (source, child) = spawn_markdown_watch(&args.file)?;
+            (source, Some(child))
+        }
         "svg" => {
             let canonical = std::fs::canonicalize(&args.file).unwrap_or_else(|_| args.file.clone());
             (Source::Svg(canonical), None)
@@ -1587,7 +1591,10 @@ fn render_headless(args: &Args) -> Result<()> {
             render_svg_file(&args.file, &renderer, out_w, out_h, zoom)?
         }
         "typ" => render_typ_headless(&args.file, page_idx, out_w, out_h, zoom)?,
-        other => bail!("unsupported extension: .{other} (only svg / typ / pdf are supported)"),
+        "md" | "markdown" => render_md_headless(&args.file, page_idx, out_w, out_h, zoom)?,
+        other => bail!(
+            "unsupported extension: .{other} (only svg / typ / md / markdown / pdf are supported)"
+        ),
     };
     write_png(&rgba, out_w, out_h, output)
 }
@@ -1614,13 +1621,49 @@ fn render_typ_headless(file: &Path, page: usize, out_w: u32, out_h: u32, zoom: u
     if which_typst().is_none() {
         bail!("typst is not on PATH. Typst rendering requires typst.");
     }
+    let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("vv");
+    compile_typst_headless(file, None, stem, page, out_w, out_h, zoom)
+}
+
+/// Headlessly render one page of a Markdown file: generate a temp typst wrapper that renders it via
+/// the cmarker package, compile it, and draw the page. Same cleanup as the typst path.
+fn render_md_headless(file: &Path, page: usize, out_w: u32, out_h: u32, zoom: u32) -> Result<Vec<u8>> {
+    if which_typst().is_none() {
+        bail!("typst is not on PATH. Markdown rendering uses typst + the cmarker package.");
+    }
     let dir = std::env::temp_dir();
     let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("vv");
     let tag = std::process::id();
+    // Named with the same prefix the compile cleanup sweeps, so the wrapper is removed too.
+    let wrapper = dir.join(format!("vv-render-{stem}-{tag}-main.typ"));
+    std::fs::write(&wrapper, cmarker_wrapper_src(file)?)
+        .context("failed to write markdown wrapper")?;
+    // --root "/" so typst may read the .md (and absolute-path images) outside the temp dir.
+    compile_typst_headless(&wrapper, Some("/"), stem, page, out_w, out_h, zoom)
+}
+
+/// Shared by [`render_typ_headless`] / [`render_md_headless`]: compile `main` with `typst compile`
+/// (optional `--root`), then rasterize page `page` of the emitted SVGs. Temp SVGs (and any temp
+/// `vv-render-<stem>-<pid>-*` files such as a markdown wrapper) are cleaned up afterward.
+fn compile_typst_headless(
+    main: &Path,
+    root: Option<&str>,
+    stem: &str,
+    page: usize,
+    out_w: u32,
+    out_h: u32,
+    zoom: u32,
+) -> Result<Vec<u8>> {
+    let dir = std::env::temp_dir();
+    let tag = std::process::id();
     let template = dir.join(format!("vv-render-{stem}-{tag}-{{p}}.svg"));
-    let ok = Command::new("typst")
-        .arg("compile")
-        .arg(file)
+    let mut cmd = Command::new("typst");
+    cmd.arg("compile");
+    if let Some(r) = root {
+        cmd.arg("--root").arg(r);
+    }
+    let ok = cmd
+        .arg(main)
         .arg(&template)
         .arg("--format")
         .arg("svg")
@@ -1629,7 +1672,7 @@ fn render_typ_headless(file: &Path, page: usize, out_w: u32, out_h: u32, zoom: u
         .status()
         .context("failed to launch typst compile")?
         .success();
-    // Delete the temp SVGs we emitted (for all pages).
+    // Delete the temp files we emitted (all page SVGs plus any wrapper).
     let cleanup = || {
         let prefix = format!("vv-render-{stem}-{tag}-");
         if let Ok(rd) = std::fs::read_dir(&dir) {
@@ -1653,6 +1696,23 @@ fn render_typ_headless(file: &Path, page: usize, out_w: u32, out_h: u32, zoom: u
     let res = render_svg_file(&page_svg, &renderer, out_w, out_h, zoom);
     cleanup();
     res
+}
+
+/// Build the source of a temp typst file that renders a Markdown file via the cmarker package.
+/// `typst watch`/`compile` tracks the `read()` dependency, so editing the `.md` triggers a rebuild.
+fn cmarker_wrapper_src(md: &Path) -> Result<String> {
+    let md_abs = std::fs::canonicalize(md).unwrap_or_else(|_| md.to_path_buf());
+    // Escape the path for a typst string literal.
+    let esc = md_abs
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    Ok(format!(
+        "#import \"@preview/cmarker:0.1.9\"\n\
+         #set page(width: 21cm, height: auto, margin: 1.5cm)\n\
+         #set text(size: 11pt)\n\
+         #cmarker.render(read(\"{esc}\"))\n"
+    ))
 }
 
 /// Open an SVG file and draw it to RGBA at the page-center, given-zoom viewport (shared by headless).
@@ -1775,6 +1835,45 @@ fn spawn_typst_watch(typ: &Path) -> Result<(Source, Child)> {
         .stderr(Stdio::inherit()) // Show typst's compile errors.
         .spawn()
         .context("failed to launch typst watch")?;
+
+    Ok((Source::Typst { dir, stem, tag }, child))
+}
+
+/// Launch a live Markdown preview. Writes a temp typst wrapper that renders the `.md` via the
+/// cmarker package, then runs `typst watch` on it. typst tracks the `read()` dependency, so editing
+/// the `.md` recompiles and updates the preview, reusing the whole Typst pipeline (`Source::Typst`).
+fn spawn_markdown_watch(md: &Path) -> Result<(Source, Child)> {
+    if which_typst().is_none() {
+        bail!("typst is not on PATH. Markdown preview renders via typst + the cmarker package.");
+    }
+    let stem = md
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("vecview")
+        .to_string();
+    let dir = std::env::temp_dir();
+    let tag = std::process::id();
+    sweep_dead_typst_pages(&dir, &stem);
+    // The wrapper shares the page-file prefix so Source::cleanup() removes it on exit too. It is a
+    // `.typ`, so owns() (which requires `.svg`) won't mistake it for a page.
+    let wrapper = dir.join(format!("vecview-{stem}-{tag}-main.typ"));
+    std::fs::write(&wrapper, cmarker_wrapper_src(md)?)
+        .context("failed to write markdown wrapper")?;
+    let template = dir.join(format!("vecview-{stem}-{tag}-{{p}}.svg"));
+
+    // --root "/" so typst may read the .md (and absolute-path images) outside the temp dir.
+    let child = Command::new("typst")
+        .arg("watch")
+        .arg("--root")
+        .arg("/")
+        .arg(&wrapper)
+        .arg(&template)
+        .arg("--format")
+        .arg("svg")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit()) // Show typst/cmarker compile errors.
+        .spawn()
+        .context("failed to launch typst watch (markdown)")?;
 
     Ok((Source::Typst { dir, stem, tag }, child))
 }
