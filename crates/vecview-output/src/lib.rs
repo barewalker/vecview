@@ -24,6 +24,127 @@ use std::io::IsTerminal;
 
 use vecview_core::OutputBackend;
 
+/// Detected terminal cell size in pixels `(width, height)`, or `None` if undeterminable.
+///
+/// Resolution order (cached — the terminal round-trip happens at most once):
+/// 1. `VECVIEW_CELL_PX=WxH` manual override.
+/// 2. The pixel size reported by the kernel/terminal (`TIOCGWINSZ`) — works outside tmux.
+/// 3. A one-shot `CSI 16 t` query to the real terminal (wrapped in tmux passthrough when inside
+///    tmux, which otherwise zeroes the pixel size), parsing the `CSI 6 ; height ; width t` reply.
+///    Needs an interactive TTY already in raw mode, so call it once at startup after raw mode is on.
+pub fn cell_px() -> Option<(u32, u32)> {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+    *CELL.get_or_init(detect_cell_px)
+}
+
+fn detect_cell_px() -> Option<(u32, u32)> {
+    if let Some(c) = std::env::var("VECVIEW_CELL_PX")
+        .ok()
+        .and_then(|s| parse_wxh(&s))
+    {
+        return Some(c);
+    }
+    if let Ok(ws) = crossterm::terminal::window_size() {
+        if ws.width > 0 && ws.height > 0 && ws.columns > 0 && ws.rows > 0 {
+            return Some((
+                (ws.width as u32 / ws.columns as u32).max(1),
+                (ws.height as u32 / ws.rows as u32).max(1),
+            ));
+        }
+    }
+    query_cell_px()
+}
+
+/// Parse `"WxH"` (separator `x`/`X`) into pixel dimensions, clamped to 1..=256.
+fn parse_wxh(s: &str) -> Option<(u32, u32)> {
+    let (w, h) = s.trim().split_once(['x', 'X'])?;
+    let w: u32 = w.trim().parse().ok()?;
+    let h: u32 = h.trim().parse().ok()?;
+    Some((w.clamp(1, 256), h.clamp(1, 256)))
+}
+
+/// Ask the real terminal for its cell size via `CSI 16 t`. Only on an interactive TTY (the reply
+/// must be readable from stdin in raw mode, without echo/line buffering).
+fn query_cell_px() -> Option<(u32, u32)> {
+    use std::io::Write;
+    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+        return None;
+    }
+    let in_tmux = std::env::var_os("TMUX").is_some();
+    {
+        let mut out = std::io::stdout().lock();
+        let inner = b"\x1b[16t";
+        if in_tmux {
+            // \ePtmux; <inner, each ESC doubled> \e\\  — reach the outer terminal, not tmux.
+            let _ = out.write_all(b"\x1bPtmux;");
+            for &b in inner {
+                if b == 0x1b {
+                    let _ = out.write_all(b"\x1b\x1b");
+                } else {
+                    let _ = out.write_all(&[b]);
+                }
+            }
+            let _ = out.write_all(b"\x1b\\");
+        } else {
+            let _ = out.write_all(inner);
+        }
+        let _ = out.flush();
+    }
+    read_cell_reply(std::time::Duration::from_millis(200))
+}
+
+/// Read a `CSI 6 ; height ; width t` reply from stdin within `timeout`, returning `(width, height)`.
+fn read_cell_reply(timeout: std::time::Duration) -> Option<(u32, u32)> {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use std::io::Read;
+    use std::os::fd::BorrowedFd;
+    use std::time::Instant;
+
+    // SAFETY: fd 0 (stdin) is valid for the lifetime of an interactive process.
+    let fd = unsafe { BorrowedFd::borrow_raw(0) };
+    let deadline = Instant::now() + timeout;
+    let mut buf: Vec<u8> = Vec::with_capacity(32);
+    let mut tmp = [0u8; 32];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let mut fds = [PollFd::new(fd, PollFlags::POLLIN)];
+        let to = PollTimeout::try_from(remaining).unwrap_or(PollTimeout::ZERO);
+        match poll(&mut fds, to) {
+            Ok(0) => return None, // timed out
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => return None,
+        }
+        match std::io::stdin().lock().read(&mut tmp) {
+            Ok(0) => return None,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(_) => return None,
+        }
+        if let Some(c) = parse_cell_reply(&buf) {
+            return Some(c);
+        }
+        // A terminator arrived but didn't parse: stop so we don't swallow later keystrokes.
+        if buf.contains(&b't') {
+            return None;
+        }
+    }
+}
+
+/// Parse `ESC [ 6 ; <height> ; <width> t` anywhere in `buf` into `(width, height)`.
+fn parse_cell_reply(buf: &[u8]) -> Option<(u32, u32)> {
+    let s = std::str::from_utf8(buf).ok()?;
+    let rest = &s[s.find("\x1b[6;")? + 4..];
+    let end = rest.find('t')?;
+    let mut it = rest[..end].split(';');
+    let h: u32 = it.next()?.trim().parse().ok()?;
+    let w: u32 = it.next()?.trim().parse().ok()?;
+    (w > 0 && h > 0).then_some((w.clamp(1, 256), h.clamp(1, 256)))
+}
+
 /// The displayable pixel area of the output target (width/height).
 #[derive(Clone, Copy, Debug)]
 pub struct DisplaySize {

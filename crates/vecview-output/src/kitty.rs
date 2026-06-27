@@ -286,16 +286,13 @@ impl OutputBackend for KittyBackend {
 /// Computes the number of cells (columns/rows) the image should occupy from the terminal's cell
 /// size. Caps it by the size of the diacritics table and the terminal's cell count.
 fn cell_footprint(w: u32, h: u32) -> (u32, u32) {
-    let (cell_w, cell_h, max_cols, max_rows) = match crossterm::terminal::window_size() {
-        Ok(ws) if ws.width > 0 && ws.height > 0 && ws.columns > 0 && ws.rows > 0 => (
-            (ws.width as u32 / ws.columns as u32).max(1),
-            (ws.height as u32 / ws.rows as u32).max(1),
-            ws.columns as u32,
-            ws.rows as u32,
-        ),
-        Ok(ws) if ws.columns > 0 && ws.rows > 0 => (8, 16, ws.columns as u32, ws.rows as u32),
-        _ => (8, 16, 80, 24),
+    // cols/rows come from the (reliable) character grid; the pixel cell size from the shared
+    // detector (env / TIOCGWINSZ / terminal query) so it matches available_area's resolution.
+    let (max_cols, max_rows) = match crossterm::terminal::window_size() {
+        Ok(ws) if ws.columns > 0 && ws.rows > 0 => (ws.columns as u32, ws.rows as u32),
+        _ => (80, 24),
     };
+    let (cell_w, cell_h) = crate::cell_px().unwrap_or((8, 16));
     let cols = (w / cell_w)
         .max(1)
         .min(max_cols)

@@ -23,7 +23,7 @@ use crossterm::event::{
 use notify_debouncer_full::notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use vecview_core::{Document, DrawCommand, OutputBackend, Page, PathSegment};
-use vecview_output::detect_backend;
+use vecview_output::{cell_px, detect_backend};
 use vecview_renderer::Renderer;
 use vecview_svg::SvgDocument;
 
@@ -341,6 +341,10 @@ fn main() -> Result<()> {
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
     if interactive {
         crossterm::terminal::enable_raw_mode().ok();
+        // Detect the terminal cell size now, while we have exclusive stdin in raw mode — it may send
+        // a `CSI 16 t` query and read the reply, which must not race the key-input thread below. The
+        // result is cached for available_area()/cell_footprint().
+        let _ = cell_px();
         // Enable mouse reporting for text selection (disabled on exit).
         crossterm::execute!(std::io::stdout(), EnableMouseCapture).ok();
         let key_tx = tx.clone();
@@ -1968,7 +1972,8 @@ fn available_area(backend_name: &str, scale: u32) -> (u32, u32) {
     // SSH+tmux etc., pixel dimensions don't propagate (width/height=0) and the actual cell size
     // differs from the estimate, so Sixel displays shrunken; tuning it once per environment lets
     // the pane be filled correctly thereafter.
-    let (cell_w, cell_h) = fallback_cell_px();
+    // Cell size: VECVIEW_CELL_PX → TIOCGWINSZ → a one-shot terminal query (covers tmux), else 8x16.
+    let (cell_w, cell_h) = cell_px().unwrap_or((8, 16));
     if let Ok(ws) = crossterm::terminal::window_size() {
         if ws.width > 0 && ws.height > 0 {
             return (ws.width as u32, ws.height as u32);
@@ -2170,7 +2175,18 @@ fn probe_and_exit(backend: Option<&str>, scale: u32) -> ! {
         Err(e) => println!("window_size        = error: {e}"),
     }
     let (cw, ch) = fallback_cell_px();
-    println!("fallback cell(px)  = {cw} x {ch}  <- overridable via VECVIEW_CELL_PX (used when pixels are 0)");
+    println!("fallback cell(px)  = {cw} x {ch}  <- used only if detection fails");
+    // Detect the real cell size (may query the terminal via CSI 16 t); needs raw mode so the reply
+    // isn't echoed/line-buffered.
+    let raw = crossterm::terminal::enable_raw_mode().is_ok();
+    let detected = cell_px();
+    if raw {
+        crossterm::terminal::disable_raw_mode().ok();
+    }
+    match detected {
+        Some((dw, dh)) => println!("detected cell(px)  = {dw} x {dh}  <- TIOCGWINSZ / CSI 16t query / VECVIEW_CELL_PX"),
+        None => println!("detected cell(px)  = none (using fallback)"),
+    }
     let (w, h) = available_area(b.name(), scale);
     println!("available_area(px) = {w} x {h}  <- rasterizing at this resolution");
     std::process::exit(0);
