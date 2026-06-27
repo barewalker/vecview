@@ -206,6 +206,7 @@ set -as terminal-features '*:sixel'
 |---|---|---|
 | `VECVIEW_BACKEND` | auto-detect | Force a backend `[kitty\|tmux\|sixel\|framebuffer]` |
 | `VECVIEW_AA_SS` | `2` | Internal supersampling for SVG/Typst/Markdown anti-aliasing (1..=4). The scene is rendered at this multiple and downsampled back, sharpening text/curve edges **without** enlarging the transferred image. `1` disables it (faster, but jaggier). Independent of `-s` |
+| `VECVIEW_MD_PAGE` | `a4` | Page geometry for Markdown. A typst paper name (e.g. `a4`, `us-letter`) paginates long documents into pages you flip with `j`/`k`; `auto` makes one continuous (scroll-only) page |
 | `VECVIEW_SCALE` | `1` | Transfer-resolution supersampling factor (1..=4). Also settable with `-s`. Sends a larger image for the terminal to downscale; sharper but transfer size grows with the square of the factor (can destabilize tmux/sixel) |
 | `VECVIEW_CELL_PX` | auto | Manual override of the terminal cell size `WxH`. Normally auto-detected (`TIOCGWINSZ`, or a `CSI 16t` query that works through tmux); set this only if detection is wrong or unavailable |
 | `VECVIEW_MIN_FRAME_MS` | `200` (over tmux) / `80` (direct) | Minimum interval (ms) between image transfers during continuous input. Smaller is smoother but becomes unstable if it outruns the terminal |

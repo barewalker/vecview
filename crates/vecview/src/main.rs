@@ -37,6 +37,9 @@ enum Msg {
     Key(KeyEvent),
     /// Mouse input (for text selection).
     Mouse(MouseEvent),
+    /// A line from the typst child's stderr (compile status / errors), shown in our status line
+    /// instead of being written straight to the terminal (which corrupts the image in tmux splits).
+    TypstMsg(String),
 }
 
 /// Display source. SVG/Typst use per-page SVG files; PDF is drawn directly by pdfium.
@@ -337,6 +340,26 @@ fn main() -> Result<()> {
     })
     .context("Ctrl-C handler setup")?;
 
+    // Drain the typst child's stderr on a thread and forward each line as a message, so its compile
+    // status/errors appear in our status line rather than being written straight to the terminal
+    // (which interleaves with the image and garbles tmux split panes).
+    if let Some(stderr) = child.as_mut().and_then(|c| c.stderr.take()) {
+        let log_tx = tx.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stderr).lines() {
+                match line {
+                    Ok(l) => {
+                        if log_tx.send(Msg::TypstMsg(l)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
     // If a TTY, run interactively (raw mode + key input thread).
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
     if interactive {
@@ -621,6 +644,21 @@ fn main() -> Result<()> {
                     }
                 }
                 Msg::Reload => reload = true,
+                Msg::TypstMsg(line) => {
+                    // Surface typst/cmarker output in our status line. Show errors; clear on a clean
+                    // compile. Ignore the routine "watching…/writing to…" chatter.
+                    let l = line.trim();
+                    let low = l.to_ascii_lowercase();
+                    if low.contains("error") {
+                        let shown: String = l.chars().take(200).collect();
+                        state.status = Some(shown);
+                        overlay_only = true;
+                    } else if low.contains("compiled successfully") {
+                        // Clear any previous error message (empty status blanks the line once).
+                        state.status = Some(String::new());
+                        overlay_only = true;
+                    }
+                }
             }
         }
 
@@ -1711,9 +1749,21 @@ fn cmarker_wrapper_src(md: &Path) -> Result<String> {
         .to_string_lossy()
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
+    // Page geometry. Default to a paged size (A4) so a long document splits into pages that vv's
+    // page navigation (j/k, PageUp/Down) can flip through, instead of one giant scroll-only page.
+    // VECVIEW_MD_PAGE overrides: "auto" = single continuous page; otherwise a typst paper name
+    // (e.g. "a4", "us-letter").
+    let page_set = match std::env::var("VECVIEW_MD_PAGE").ok().map(|s| s.trim().to_ascii_lowercase())
+    {
+        Some(s) if s == "auto" => "#set page(width: 21cm, height: auto, margin: 1.5cm)".to_string(),
+        Some(s) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => {
+            format!("#set page(paper: \"{s}\", margin: 1.5cm)")
+        }
+        _ => "#set page(paper: \"a4\", margin: 1.5cm)".to_string(),
+    };
     Ok(format!(
         "#import \"@preview/cmarker:0.1.9\"\n\
-         #set page(width: 21cm, height: auto, margin: 1.5cm)\n\
+         {page_set}\n\
          #set text(size: 11pt)\n\
          #cmarker.render(read(\"{esc}\"))\n"
     ))
@@ -1836,7 +1886,7 @@ fn spawn_typst_watch(typ: &Path) -> Result<(Source, Child)> {
         .arg("--format")
         .arg("svg")
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit()) // Show typst's compile errors.
+        .stderr(Stdio::piped()) // Captured and surfaced in vv's status line (see the reader thread).
         .spawn()
         .context("failed to launch typst watch")?;
 
@@ -1875,7 +1925,7 @@ fn spawn_markdown_watch(md: &Path) -> Result<(Source, Child)> {
         .arg("--format")
         .arg("svg")
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit()) // Show typst/cmarker compile errors.
+        .stderr(Stdio::piped()) // Captured and surfaced in vv's status line (see the reader thread).
         .spawn()
         .context("failed to launch typst watch (markdown)")?;
 
