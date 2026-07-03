@@ -196,7 +196,7 @@ struct Args {
     #[arg(short, long, default_value_t = 100)]
     zoom: u32,
 
-    /// Force the output backend [kitty|tmux|sixel|framebuffer]. Can also be set via the
+    /// Force the output backend [kitty|tmux|herdr|sixel|framebuffer]. Can also be set via the
     /// VECVIEW_BACKEND environment variable.
     #[arg(short, long)]
     backend: Option<String>,

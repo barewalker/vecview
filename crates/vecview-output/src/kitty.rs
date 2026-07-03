@@ -35,8 +35,15 @@ const CHUNK: usize = 4096;
 const PLACEHOLDER: char = '\u{10EEEE}';
 
 pub struct KittyBackend {
-    /// Whether to use tmux passthrough (plus placeholder placement).
-    tmux: bool,
+    /// Wrap each APC in tmux's DCS passthrough (`\ePtmux;`…). Real tmux only — herdr and bare
+    /// kitty-capable terminals parse the raw APC directly, so this stays false for them.
+    passthrough: bool,
+    /// Place the image as a virtual placement (`U=1`) plus Unicode placeholder cells instead of a
+    /// direct (`a=T`) placement. Required by any pane multiplexer (tmux, herdr) so the image is
+    /// tracked as text cells and clipped within the pane. It also lets herdr — which never reports
+    /// a pixel cell size to the pane — size the image by the cell grid (`c=`/`r=`) instead of by
+    /// pixels; direct/pixel placement can't be positioned without a known cell size.
+    placeholder: bool,
     /// Base of the image IDs (23 bits) unique to this vecview instance. Kitty image IDs are global
     /// to the terminal, so when multiple vecviews run across multiple windows, a fixed ID would
     /// cause them to overwrite and wrongly delete each other's images. We derive a unique value
@@ -53,13 +60,26 @@ pub struct KittyBackend {
 }
 
 impl KittyBackend {
+    /// A bare kitty-capable terminal (`tmux=false`) or real tmux (`tmux=true`). tmux needs both DCS
+    /// passthrough and placeholder placement.
     pub fn new(tmux: bool) -> Self {
+        Self::with_modes(tmux, tmux)
+    }
+
+    /// herdr (and any multiplexer that parses raw kitty APC yet still needs pane-tracked
+    /// placement): placeholder placement, no tmux DCS wrapping.
+    pub fn placeholder_raw() -> Self {
+        Self::with_modes(false, true)
+    }
+
+    fn with_modes(passthrough: bool, placeholder: bool) -> Self {
         // Fit the PID into 23 bits to use as the base ID (avoiding 0). Leave bit23 free, as it is
         // used for the double-buffer toggle. The chance of colliding with another concurrent
         // instance is effectively zero.
         let base_id = (std::process::id() & 0x007F_FFFF).max(1);
         Self {
-            tmux,
+            passthrough,
+            placeholder,
             base_id,
             toggle: RefCell::new(false),
             live: RefCell::new(None),
@@ -99,7 +119,7 @@ impl KittyBackend {
     /// Writes out an APC graphics sequence (wrapping it for tmux if necessary).
     /// `body` is the `_G...` part (the content, without the leading ESC or trailing ST).
     fn write_apc(&self, out: &mut impl Write, body: &[u8]) -> std::io::Result<()> {
-        if self.tmux {
+        if self.passthrough {
             out.write_all(b"\x1bPtmux;")?;
             // Embed the entire inner APC sequence (including the ESC), doubling each ESC.
             let mut seq = Vec::with_capacity(body.len() + 4);
@@ -225,10 +245,10 @@ impl KittyBackend {
 
 impl OutputBackend for KittyBackend {
     fn name(&self) -> &str {
-        if self.tmux {
-            "kitty (tmux placeholder)"
-        } else {
-            "kitty"
+        match (self.passthrough, self.placeholder) {
+            (true, _) => "kitty (tmux placeholder)",
+            (false, true) => "kitty (herdr placeholder)",
+            (false, false) => "kitty",
         }
     }
 
@@ -273,7 +293,7 @@ impl OutputBackend for KittyBackend {
     fn display(&self, rgba: &[u8], width: u32, height: u32) -> Result<()> {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        if self.tmux {
+        if self.placeholder {
             self.display_placeholder(&mut out, rgba, width, height)?;
         } else {
             self.display_direct(&mut out, rgba, width, height)?;

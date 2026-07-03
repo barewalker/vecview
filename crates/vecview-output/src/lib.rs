@@ -152,15 +152,26 @@ pub struct DisplaySize {
     pub height: u32,
 }
 
-/// Auto-detects the backend. Can also be specified explicitly via `force` (kitty/tmux/framebuffer).
+/// Auto-detects the backend. Can also be specified explicitly via `force`
+/// (kitty/tmux/herdr/sixel/framebuffer).
 pub fn detect_backend(force: Option<&str>) -> Box<dyn OutputBackend> {
     if let Some(name) = force {
         return forced_backend(name);
     }
 
     let in_tmux = std::env::var_os("TMUX").is_some();
+    let in_herdr = is_herdr();
     let kitty_capable = is_kitty_capable();
     let is_tty = std::io::stdout().is_terminal();
+
+    // 0. herdr renders kitty graphics through an embedded ghostty core, but only from *virtual*
+    //    placements: it never reports a pixel cell size to the pane, so a direct (pixel) placement
+    //    can't be positioned and is silently dropped. Emit raw APC (herdr parses it directly, so no
+    //    tmux DCS wrapping) plus Unicode-placeholder placement. Checked before kitty_capable because
+    //    KITTY_WINDOW_ID leaks into the pane and would otherwise pick the direct-placement path.
+    if in_herdr {
+        return Box::new(KittyBackend::placeholder_raw());
+    }
 
     // 1. Kitty-capable terminal (wrapped if inside tmux). The dev environment falls here.
     if kitty_capable {
@@ -194,12 +205,18 @@ fn forced_backend(name: &str) -> Box<dyn OutputBackend> {
     match name {
         "kitty" => Box::new(KittyBackend::new(false)),
         "tmux" => Box::new(KittyBackend::new(true)),
+        "herdr" => Box::new(KittyBackend::placeholder_raw()),
         "sixel" => Box::new(SixelBackend::new(in_tmux)),
         #[cfg(target_os = "linux")]
         "framebuffer" => Box::new(FramebufferBackend::new("/dev/fb0")),
         // An unknown specification falls back to Kitty based on in_tmux.
         _ => Box::new(KittyBackend::new(in_tmux)),
     }
+}
+
+/// Whether we're running inside a herdr-managed pane (its env is exported to every pane).
+fn is_herdr() -> bool {
+    std::env::var_os("HERDR_ENV").is_some() || std::env::var_os("HERDR_PANE_ID").is_some()
 }
 
 /// Whether we're on Windows Terminal (best-effort). Note that WT_SESSION is often not visible inside WSL.
