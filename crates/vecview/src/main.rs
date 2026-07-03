@@ -39,7 +39,7 @@ enum Msg {
     Mouse(MouseEvent),
     /// A line from the typst child's stderr (compile status / errors), shown in our status line
     /// instead of being written straight to the terminal (which corrupts the image in tmux splits).
-    TypstMsg(String),
+    Typst(String),
 }
 
 /// Display source. SVG/Typst use per-page SVG files; PDF is drawn directly by pdfium.
@@ -366,7 +366,7 @@ fn main() -> Result<()> {
             for line in std::io::BufReader::new(stderr).lines() {
                 match line {
                     Ok(l) => {
-                        if log_tx.send(Msg::TypstMsg(l)).is_err() {
+                        if log_tx.send(Msg::Typst(l)).is_err() {
                             break;
                         }
                     }
@@ -673,7 +673,7 @@ fn main() -> Result<()> {
                     }
                 }
                 Msg::Reload => reload = true,
-                Msg::TypstMsg(line) => {
+                Msg::Typst(line) => {
                     // Surface typst/cmarker output in our status line. Show errors; clear on a clean
                     // compile. Ignore the routine "watching…/writing to…" chatter.
                     let l = line.trim();
