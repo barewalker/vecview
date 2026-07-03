@@ -1698,7 +1698,8 @@ fn render_typ_headless(file: &Path, page: usize, out_w: u32, out_h: u32, zoom: u
         bail!("typst is not on PATH. Typst rendering requires typst.");
     }
     let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("vv");
-    compile_typst_headless(file, None, stem, page, out_w, out_h, zoom)
+    let root = typst_root(file);
+    compile_typst_headless(file, root.as_deref(), stem, page, out_w, out_h, zoom)
 }
 
 /// Headlessly render one page of a Markdown file: generate a temp typst wrapper that renders it via
@@ -1715,7 +1716,7 @@ fn render_md_headless(file: &Path, page: usize, out_w: u32, out_h: u32, zoom: u3
     std::fs::write(&wrapper, cmarker_wrapper_src(file)?)
         .context("failed to write markdown wrapper")?;
     // --root "/" so typst may read the .md (and absolute-path images) outside the temp dir.
-    compile_typst_headless(&wrapper, Some("/"), stem, page, out_w, out_h, zoom)
+    compile_typst_headless(&wrapper, Some(Path::new("/")), stem, page, out_w, out_h, zoom)
 }
 
 /// Shared by [`render_typ_headless`] / [`render_md_headless`]: compile `main` with `typst compile`
@@ -1723,7 +1724,7 @@ fn render_md_headless(file: &Path, page: usize, out_w: u32, out_h: u32, zoom: u3
 /// `vv-render-<stem>-<pid>-*` files such as a markdown wrapper) are cleaned up afterward.
 fn compile_typst_headless(
     main: &Path,
-    root: Option<&str>,
+    root: Option<&Path>,
     stem: &str,
     page: usize,
     out_w: u32,
@@ -1913,12 +1914,14 @@ fn spawn_typst_watch(typ: &Path) -> Result<(Source, Child)> {
     // Use the page-number template {p} so typst doesn't error on multi-page documents.
     let template = dir.join(format!("vecview-{stem}-{tag}-{{p}}.svg"));
 
-    let child = Command::new("typst")
-        .arg("watch")
-        .arg(typ)
-        .arg(&template)
-        .arg("--format")
-        .arg("svg")
+    let mut cmd = Command::new("typst");
+    cmd.arg("watch").arg(typ).arg(&template).arg("--format").arg("svg");
+    // Set typst's project root so leading-slash image paths (e.g. `image("/analysis/x.svg")`)
+    // resolve against the project root rather than the document's own directory (typst's default).
+    if let Some(root) = typst_root(typ) {
+        cmd.arg("--root").arg(root);
+    }
+    let child = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::piped()) // Captured and surfaced in vv's status line (see the reader thread).
         .spawn()
@@ -1974,7 +1977,10 @@ fn export_to_pdf(file: &Path, ext: &str, out: &Path) -> Result<()> {
         bail!("typst is not on PATH. PDF export requires typst.");
     }
     match ext {
-        "typ" => typst_compile_pdf(file, None, out),
+        "typ" => {
+            let root = typst_root(file);
+            typst_compile_pdf(file, root.as_deref(), out)
+        }
         "md" | "markdown" => {
             let dir = std::env::temp_dir();
             let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("vv");
@@ -1982,7 +1988,7 @@ fn export_to_pdf(file: &Path, ext: &str, out: &Path) -> Result<()> {
             let wrapper = dir.join(format!("vv-export-{stem}-{tag}.typ"));
             std::fs::write(&wrapper, cmarker_wrapper_src(file)?)
                 .context("failed to write markdown wrapper")?;
-            let r = typst_compile_pdf(&wrapper, Some("/"), out);
+            let r = typst_compile_pdf(&wrapper, Some(Path::new("/")), out);
             let _ = std::fs::remove_file(&wrapper);
             r
         }
@@ -1992,7 +1998,7 @@ fn export_to_pdf(file: &Path, ext: &str, out: &Path) -> Result<()> {
 
 /// Run `typst compile <main> <out> --format pdf` (optional `--root`), capturing stderr so it never
 /// leaks onto the terminal; a compile error is surfaced via the returned `Err`.
-fn typst_compile_pdf(main: &Path, root: Option<&str>, out: &Path) -> Result<()> {
+fn typst_compile_pdf(main: &Path, root: Option<&Path>, out: &Path) -> Result<()> {
     let mut cmd = Command::new("typst");
     cmd.arg("compile");
     if let Some(r) = root {
@@ -2027,6 +2033,30 @@ fn which_typst() -> Option<PathBuf> {
         let candidate = dir.join("typst");
         candidate.is_file().then_some(candidate)
     })
+}
+
+/// Best-effort typst project root for a document, used for `--root`. typst resolves leading-slash
+/// absolute paths (e.g. `image("/analysis/x.svg")`) against the root and bounds file access to it;
+/// its default is the document's own directory, which breaks documents whose assets live at the
+/// project root while the `.typ` sits in a subdirectory.
+///
+/// Walk up from the document for a project marker (`typst.toml`, then a `.git` entry); the first
+/// match — always an ancestor of the document, so a valid root — wins. With no marker, fall back to
+/// the current directory when the document lives under it (so `vv sub/doc.typ` from a project root
+/// still works). `None` keeps typst's default. Honors an explicit `TYPST_ROOT` if already set.
+fn typst_root(doc: &Path) -> Option<PathBuf> {
+    if std::env::var_os("TYPST_ROOT").is_some() {
+        return None; // Respect the user's explicit choice; typst reads it itself.
+    }
+    let canon = doc.canonicalize().ok()?;
+    let start = canon.parent()?;
+    for dir in start.ancestors() {
+        if dir.join("typst.toml").is_file() || dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+    }
+    let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
+    start.starts_with(&cwd).then_some(cwd)
 }
 
 /// Load the SVG and render/display the viewport for the current zoom/pan state.
