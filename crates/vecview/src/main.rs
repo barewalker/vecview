@@ -1347,12 +1347,15 @@ fn build_text_layer(
             // .typ to PDF as well and use its characters + coordinates (pt dimensions match the
             // SVG). PID-tagged to avoid collisions with other instances.
             let pdf_path = dir.join(format!("vecview-{stem}-{tag}-text.pdf"));
-            let ok = Command::new("typst")
-                .arg("compile")
-                .arg(typ_path)
-                .arg(&pdf_path)
-                .arg("--format")
-                .arg("pdf")
+            let mut cmd = Command::new("typst");
+            cmd.arg("compile").arg(typ_path).arg(&pdf_path).arg("--format").arg("pdf");
+            // Same project-root resolution as the live preview, so a document whose assets sit at
+            // the project root (leading-slash image paths) still compiles here; otherwise the text
+            // layer fails to build and copy mode can't be entered.
+            if let Some(root) = typst_root(typ_path) {
+                cmd.arg("--root").arg(root);
+            }
+            let ok = cmd
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
