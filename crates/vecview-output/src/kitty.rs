@@ -291,6 +291,8 @@ impl OutputBackend for KittyBackend {
     }
 
     fn display(&self, rgba: &[u8], width: u32, height: u32) -> Result<()> {
+        let timing = std::env::var_os("VECVIEW_TIMING").is_some();
+        let t0 = timing.then(std::time::Instant::now);
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
         if self.placeholder {
@@ -299,6 +301,14 @@ impl OutputBackend for KittyBackend {
             self.display_direct(&mut out, rgba, width, height)?;
         }
         out.flush()?;
+        // VECVIEW_TIMING: report the encode + write-to-terminal cost (this is vecview's own cost; it
+        // excludes the multiplexer's async decode/composite, which happens after the bytes are sent).
+        if let Some(t0) = t0 {
+            eprintln!(
+                "vv-timing display {width}x{height} = {:.1} ms",
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         Ok(())
     }
 }
