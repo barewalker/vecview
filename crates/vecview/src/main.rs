@@ -279,6 +279,10 @@ fn main() -> Result<()> {
     // PDF is drawn directly with pdfium (the pdftocairo->SVG->usvg path shifts figures due to a
     // double-application-of-transform bug on nested <use>). The opened document is kept here.
     let mut pdf_doc: Option<vecview_pdf::Pdf> = None;
+    // The mtime of the PDF as last loaded. pdfium keeps the file open, so a render's read bumps the
+    // atime and re-fires notify; this lets the reload path skip reopening when the file didn't
+    // actually change, breaking that self-trigger loop (mirrors the SVG/Typst mtime guard).
+    let mut pdf_mtime: Option<SystemTime> = None;
 
     // Typst launches `typst watch` to generate SVG. SVG is watched as-is.
     let (source, mut child) = match ext.as_str() {
@@ -297,6 +301,7 @@ fn main() -> Result<()> {
         "pdf" => {
             let canonical = std::fs::canonicalize(&args.file).unwrap_or_else(|_| args.file.clone());
             pdf_doc = Some(vecview_pdf::Pdf::open(&canonical).context("cannot open PDF")?);
+            pdf_mtime = mtime_of(&canonical);
             (Source::Pdf { pdf: canonical }, None)
         }
         other => bail!("unsupported extension: .{other} (only svg / typ / pdf are supported)"),
@@ -709,20 +714,27 @@ fn main() -> Result<()> {
 
         if reload {
             if let Source::Pdf { pdf } = &source {
-                // The source PDF changed, so reopen it (the watched target is the source PDF, and
-                // drawing reads from the in-memory document via pdfium, so no self-trigger occurs).
-                match vecview_pdf::Pdf::open(pdf) {
-                    Ok(doc) => {
-                        let pc = doc.page_count();
-                        pdf_doc = Some(doc);
-                        if state.page >= pc {
-                            state.page = pc - 1;
-                            state.center = None;
+                // Reopen only when the file's mtime actually changed. pdfium holds the file open, so
+                // rendering bumps its atime and re-fires notify; without this guard the reopen +
+                // redraw would self-trigger endlessly (pegging a core) after any regeneration of the
+                // PDF. mtime is unchanged by our own reads, so the spurious reloads are skipped here.
+                let current = mtime_of(pdf);
+                if current.is_some() && current != pdf_mtime {
+                    match vecview_pdf::Pdf::open(pdf) {
+                        Ok(doc) => {
+                            pdf_mtime = current;
+                            let pc = doc.page_count();
+                            pdf_doc = Some(doc);
+                            if state.page >= pc {
+                                state.page = pc - 1;
+                                state.center = None;
+                            }
+                            dirty = true;
                         }
-                        dirty = true;
+                        // Opening a PDF mid-write fails temporarily. Leave pdf_mtime unchanged so the
+                        // next Reload (once the write settles) retries.
+                        Err(e) => eprintln!("vecview: PDF reopen error: {e:#}"),
                     }
-                    // Opening a PDF mid-write fails temporarily. Retry on the next Reload.
-                    Err(e) => eprintln!("vecview: PDF reopen error: {e:#}"),
                 }
             } else {
                 // We're past compilation (debounced), so it's safe here to delete old trailing
