@@ -27,6 +27,10 @@ use vecview_output::{cell_px, detect_backend};
 use vecview_renderer::Renderer;
 use vecview_svg::SvgDocument;
 
+mod render_worker;
+
+use render_worker::{RenderWorker, RenderedPage, ViewRequest};
+
 /// Message to the redraw loop.
 enum Msg {
     /// A watched file changed.
@@ -37,6 +41,14 @@ enum Msg {
     Key(KeyEvent),
     /// Mouse input (for text selection).
     Mouse(MouseEvent),
+    /// A page finished rasterizing on the render worker.
+    Rendered(Box<RenderedPage>),
+    /// The worker opened (or reopened) the document and reports its page count.
+    Opened { pages: usize },
+    /// A page's text layer, for copy mode.
+    Text { page: usize, glyphs: Vec<vecview_pdf::Glyph> },
+    /// The worker failed; shown in the status line rather than aborting the session.
+    WorkerError(String),
     /// A line from the typst child's stderr (compile status / errors), shown in our status line
     /// instead of being written straight to the terminal (which corrupts the image in tmux splits).
     Typst(String),
@@ -179,9 +191,10 @@ fn prune_stale_typst_pages(dir: &Path, stem: &str, tag: u32) {
 
 /// The current page count. For PDF, the value from the open pdfium document; for SVG/Typst,
 /// [`Source::page_count`].
-fn current_page_count(source: &Source, pdf: Option<&vecview_pdf::Pdf>) -> usize {
+fn current_page_count(source: &Source, pdf_pages: usize) -> usize {
     match source {
-        Source::Pdf { .. } => pdf.map(|p| p.page_count()).unwrap_or(1),
+        // Reported by the render worker as `Msg::Opened`; the main thread never opens the document.
+        Source::Pdf { .. } => pdf_pages,
         other => other.page_count(),
     }
 }
@@ -233,6 +246,9 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    // For the VECVIEW_TIMING startup figure below. Taken first so it covers argument parsing,
+    // opening the document, and backend setup — everything before the first page appears.
+    let t_start = Instant::now();
     let args = Args::parse();
     // Seed the rendering/terminal variables from the config file before anything reads them (each
     // reader caches its first lookup). Still single-threaded here, as `set_var` requires.
@@ -280,8 +296,10 @@ fn main() -> Result<()> {
     }
 
     // PDF is drawn directly with pdfium (the pdftocairo->SVG->usvg path shifts figures due to a
-    // double-application-of-transform bug on nested <use>). The opened document is kept here.
-    let mut pdf_doc: Option<vecview_pdf::Pdf> = None;
+    // double-application-of-transform bug on nested <use>). The document itself lives on the render
+    // worker's thread and is never touched from here — see `render_worker` for why that matters.
+    // The page count arrives as `Msg::Opened` once the worker has it.
+    let mut pdf_pages: usize = 1;
     // The mtime of the PDF as last loaded. pdfium keeps the file open, so a render's read bumps the
     // atime and re-fires notify; this lets the reload path skip reopening when the file didn't
     // actually change, breaking that self-trigger loop (mirrors the SVG/Typst mtime guard).
@@ -303,7 +321,6 @@ fn main() -> Result<()> {
         }
         "pdf" => {
             let canonical = std::fs::canonicalize(&args.file).unwrap_or_else(|_| args.file.clone());
-            pdf_doc = Some(vecview_pdf::Pdf::open(&canonical).context("cannot open PDF")?);
             pdf_mtime = mtime_of(&canonical);
             (Source::Pdf { pdf: canonical }, None)
         }
@@ -363,6 +380,19 @@ fn main() -> Result<()> {
         let _ = quit_tx.send(Msg::Quit);
     })
     .context("Ctrl-C handler setup")?;
+
+    // PDF rasterization runs on its own thread. Started only for PDF, and once it exists it is the
+    // only thing in the process permitted to touch pdfium (see `render_worker`).
+    let mut worker = match &source {
+        Source::Pdf { pdf } => Some(RenderWorker::spawn(pdf.clone(), tx.clone())),
+        _ => None,
+    };
+    // Ordinal of the display request in flight, so a frame overtaken by a newer request is dropped
+    // instead of flashing a page the user has already moved off.
+    let mut display_seq: u64 = 0;
+    // Where a click landed while the PDF text layer was still being fetched, so the caret can be
+    // placed once it arrives.
+    let mut pending_click: Option<(u16, u16)> = None;
 
     // Drain the typst child's stderr on a thread and forward each line as a message, so its compile
     // status/errors appear in our status line rather than being written straight to the terminal
@@ -438,19 +468,31 @@ fn main() -> Result<()> {
     // Recently rendered page frames, so page flips (and prefetched neighbors) skip re-rasterizing.
     let mut cache = FrameCache::default();
 
+    // Pages already asked of the worker whose frames haven't come back yet, so a later idle slice
+    // doesn't ask for the same page twice.
+    let mut inflight: Vec<usize> = Vec::new();
+
     // Initial draw (a .typ may not exist yet since it's still being generated).
     render_current(
         &source,
-        pdf_doc.as_ref(),
+        worker.as_mut(),
         &mut state,
         renderer.as_ref(),
         backend.as_ref(),
         &mut last_render,
         &mut base_frame,
         &mut cache,
+        &mut display_seq,
     );
     // The neighbors are warmed by the idle prefetch in the loop below (`pending_prefetch` starts
     // set), not here, so startup shows the first page without first rendering pages nobody asked for.
+    //
+    // For PDF the first frame is still rasterizing on the worker, so the startup figure is reported
+    // when it actually reaches the screen (see the `Msg::Rendered` arm), not here.
+    let mut startup_at = Some(t_start);
+    if !matches!(source, Source::Pdf { .. }) {
+        report_startup(&mut startup_at);
+    }
 
     // tmux passthrough sixel gets cleared by tmux, so we time out the input wait and periodically
     // resend the most recent frame to restore it. The interval is VECVIEW_REDRAW_MS (default
@@ -548,7 +590,7 @@ fn main() -> Result<()> {
         let mut overlay_only = false; // Only the copy-mode caret/selection changed = lightweight redraw reusing the base image.
         let mut help_changed = false; // Help visibility was toggled.
 
-        let pages = current_page_count(&source, pdf_doc.as_ref());
+        let pages = current_page_count(&source, pdf_pages);
         // Whether this iteration woke on a message rather than on the wait deadline. The idle
         // prefetch below only runs on a timeout, i.e. once input has actually stopped.
         let had_input = !msgs.is_empty();
@@ -596,18 +638,27 @@ fn main() -> Result<()> {
                             help_changed = true;
                         }
                         Some(Action::EnterCopyMode) => {
-                            match build_text_layer(&source, &args.file, pdf_doc.as_ref(), state.page)
-                            {
-                                Ok(glyphs) => match CopyMode::new(glyphs) {
-                                    Some(cm) => state.copy = Some(cm),
-                                    None => {
-                                        state.status =
-                                            Some("no selectable text on this page".to_string())
+                            // PDF: the document is on the worker thread, so the text layer is
+                            // requested and copy mode opens when it arrives as `Msg::Text`.
+                            if let Some(w) = worker.as_ref() {
+                                w.text(state.page);
+                                state.status = Some("reading text layer...".to_string());
+                                overlay_only = true;
+                            } else {
+                                match build_text_layer(&source, &args.file, state.page) {
+                                    Ok(glyphs) => match CopyMode::new(glyphs) {
+                                        Some(cm) => state.copy = Some(cm),
+                                        None => {
+                                            state.status =
+                                                Some("no selectable text on this page".to_string())
+                                        }
+                                    },
+                                    Err(e) => {
+                                        state.status = Some(format!("text layer error: {e:#}"))
                                     }
-                                },
-                                Err(e) => state.status = Some(format!("text layer error: {e:#}")),
+                                }
+                                dirty = true;
                             }
-                            dirty = true;
                         }
                         Some(Action::ExportPdf) => {
                             let out = args.file.with_extension("pdf");
@@ -634,12 +685,14 @@ fn main() -> Result<()> {
                         // Press: if not in copy mode, build the text layer, enter it, and anchor on the nearest character.
                         MouseEventKind::Down(MouseButton::Left) => {
                             if state.copy.is_none() {
-                                if let Ok(glyphs) = build_text_layer(
-                                    &source,
-                                    &args.file,
-                                    pdf_doc.as_ref(),
-                                    state.page,
-                                ) {
+                                if let Some(w) = worker.as_ref() {
+                                    // PDF: the text layer comes from the worker, so remember where
+                                    // the click landed and place the caret once it arrives.
+                                    w.text(state.page);
+                                    pending_click = Some((m.column, m.row));
+                                } else if let Ok(glyphs) =
+                                    build_text_layer(&source, &args.file, state.page)
+                                {
                                     state.copy = CopyMode::new(glyphs);
                                 }
                             }
@@ -713,6 +766,79 @@ fn main() -> Result<()> {
                         overlay_only = true;
                     }
                 }
+                Msg::Rendered(frame) => {
+                    inflight.retain(|p| *p != frame.page);
+                    let shown = accept_rendered(
+                        *frame,
+                        &mut state,
+                        backend.as_ref(),
+                        &mut base_frame,
+                        &mut cache,
+                        display_seq,
+                    );
+                    if shown {
+                        // First page on screen: this is where the startup figure is finally true.
+                        report_startup(&mut startup_at);
+                        // The image is already on screen, so paint the status line over it directly
+                        // instead of flagging a redraw. Flagging one would re-enter the draw path,
+                        // which — with `center` now set by this very frame — counts as a
+                        // non-cacheable view and would post a fresh render request, whose result
+                        // would flag another redraw, and so on without end.
+                        draw_overlay_text(backend.as_ref(), &mut state);
+                        pending_full = false;
+                        pending_overlay = false;
+                        last_draw = Some(Instant::now());
+                        pending_prefetch = true;
+                    }
+                }
+                Msg::Opened { pages } => {
+                    pdf_pages = pages;
+                    // Only a reopen that left the view past the end of a now-shorter document needs
+                    // a redraw. Flagging one unconditionally would repeat the very first page: the
+                    // initial draw has already asked for it by the time this arrives.
+                    if state.page >= pdf_pages {
+                        state.page = pdf_pages.saturating_sub(1);
+                        state.center = None;
+                        dirty = true;
+                    }
+                }
+                Msg::Text { page, glyphs } => {
+                    if page == state.page {
+                        state.status = None;
+                        match CopyMode::new(glyphs) {
+                            Some(mut cm) => {
+                                // Finish a click that arrived before the text layer did.
+                                if let Some((col, row)) = pending_click.take() {
+                                    state.copy = Some(cm);
+                                    if let Some(idx) = mouse_to_glyph(&state, col, row) {
+                                        if let Some(c) = state.copy.as_mut() {
+                                            c.cursor = idx;
+                                            c.anchor = Some(idx);
+                                        }
+                                    }
+                                } else {
+                                    cm.cursor = cm.cursor.min(cm.glyphs.len().saturating_sub(1));
+                                    state.copy = Some(cm);
+                                }
+                                dirty = true;
+                            }
+                            None => {
+                                pending_click = None;
+                                state.status =
+                                    Some("no selectable text on this page".to_string());
+                                overlay_only = true;
+                            }
+                        }
+                    }
+                }
+                Msg::WorkerError(e) => {
+                    // A failed job yields no frame, so anything recorded as in flight would stay
+                    // recorded forever and those pages would never be asked for again. Clearing is
+                    // safe: a page already warm is skipped by the cache check anyway.
+                    inflight.clear();
+                    state.status = Some(format!("render error: {e}"));
+                    overlay_only = true;
+                }
             }
         }
 
@@ -729,21 +855,17 @@ fn main() -> Result<()> {
                 // PDF. mtime is unchanged by our own reads, so the spurious reloads are skipped here.
                 let current = mtime_of(pdf);
                 if current.is_some() && current != pdf_mtime {
-                    match vecview_pdf::Pdf::open(pdf) {
-                        Ok(doc) => {
-                            pdf_mtime = current;
-                            let pc = doc.page_count();
-                            pdf_doc = Some(doc);
-                            if state.page >= pc {
-                                state.page = pc - 1;
-                                state.center = None;
-                            }
-                            dirty = true;
-                        }
-                        // Opening a PDF mid-write fails temporarily. Leave pdf_mtime unchanged so the
-                        // next Reload (once the write settles) retries.
-                        Err(e) => eprintln!("vecview: PDF reopen error: {e:#}"),
+                    pdf_mtime = current;
+                    // The worker owns the document, so it does the reopening and reports the new
+                    // page count as `Msg::Opened` (which also clamps the current page). Frames
+                    // rendered from the old edition are keyed by the old mtime, so they can't be
+                    // mistaken for current ones, but drop them anyway to reclaim the memory.
+                    cache.clear();
+                    inflight.clear();
+                    if let Some(w) = worker.as_ref() {
+                        w.reopen();
                     }
+                    dirty = true;
                 }
             } else {
                 // We're past compilation (debounced), so it's safe here to delete old trailing
@@ -754,7 +876,7 @@ fn main() -> Result<()> {
                 }
                 // If the edition shrank and the page number exceeds the current count, clamp it
                 // (same as on the PDF side).
-                let pc = current_page_count(&source, pdf_doc.as_ref());
+                let pc = current_page_count(&source, pdf_pages);
                 if state.page >= pc {
                     state.page = pc - 1;
                     state.center = None;
@@ -812,26 +934,34 @@ fn main() -> Result<()> {
                 if pending_full {
                     render_current(
                         &source,
-                        pdf_doc.as_ref(),
+                        worker.as_mut(),
                         &mut state,
                         renderer.as_ref(),
                         backend.as_ref(),
                         &mut last_render,
                         &mut base_frame,
                         &mut cache,
+                        &mut display_seq,
                     );
                     full_drawn = true;
-                } else if !redraw_overlay(backend.as_ref(), &state, &base_frame) {
-                    // Lightweight copy-mode redraw. If there's no cache, fall back to a full draw.
+                } else if !redraw_overlay(backend.as_ref(), &state, &base_frame)
+                    && state.copy.is_some()
+                {
+                    // Lightweight copy-mode redraw. Falling back to a full draw is only right when
+                    // the selection is what needs repainting; outside copy mode this branch means
+                    // "only the status line changed", and the page image on screen is still correct,
+                    // so re-rasterizing it would be pure latency (`draw_overlay_text` below repaints
+                    // the line by itself).
                     render_current(
                         &source,
-                        pdf_doc.as_ref(),
+                        worker.as_mut(),
                         &mut state,
                         renderer.as_ref(),
                         backend.as_ref(),
                         &mut last_render,
                         &mut base_frame,
                         &mut cache,
+                        &mut display_seq,
                     );
                     full_drawn = true;
                 }
@@ -864,13 +994,15 @@ fn main() -> Result<()> {
             && state.copy.is_none()
             && last_draw.is_none_or(|t| Instant::now().duration_since(t) >= PREFETCH_IDLE)
         {
-            pending_prefetch = prefetch_one_neighbor(
+            pending_prefetch = prefetch_neighbors(
                 &source,
-                pdf_doc.as_ref(),
+                worker.as_ref(),
                 &state,
                 renderer.as_ref(),
                 backend.as_ref(),
                 &mut cache,
+                pages,
+                &mut inflight,
             );
         }
 
@@ -1520,14 +1652,12 @@ fn handle_copy_key(k: &KeyEvent, cm: &mut CopyMode) -> CopyOutcome {
 fn build_text_layer(
     source: &Source,
     typ_path: &Path,
-    pdf: Option<&vecview_pdf::Pdf>,
     page: usize,
 ) -> Result<Vec<vecview_pdf::Glyph>> {
     match source {
-        Source::Pdf { .. } => {
-            let doc = pdf.ok_or_else(|| anyhow!("PDF is not open"))?;
-            doc.page_text(page)
-        }
+        // The PDF path doesn't come through here: its document lives on the render worker, so the
+        // caller asks that thread for the text layer and receives it as `Msg::Text`.
+        Source::Pdf { .. } => bail!("the PDF text layer is served by the render worker"),
         Source::Typst { dir, stem, tag } => {
             // Typst SVG outlines glyphs into paths and carries no characters, so compile the same
             // .typ to PDF as well and use its characters + coordinates (pt dimensions match the
@@ -1638,16 +1768,39 @@ fn overlay_selection(rgba: &mut [u8], out_w: u32, out_h: u32, viewport: [f32; 4]
     let selecting = cm.anchor.is_some();
     let (s, e) = cm.range();
     if selecting {
+        // Merge the selected glyphs into one span per run of adjacent characters on a line, and
+        // tint that. Tinting each glyph separately leaves the gaps between them unpainted, which
+        // reads as a moth-eaten highlight — and, by turning a flat region into fine stripes, makes
+        // the frame markedly more expensive to compress for transfer (measured at roughly three
+        // times the usual zlib cost while a selection was live).
+        let mut span: Option<[f32; 4]> = None; // [x0, y0, x1, y1] in page coordinates.
         for i in s..=e {
             let r = cm.glyphs[i].rect;
             if r[2] <= 0.0 || r[3] <= 0.0 {
                 continue; // A character with no rect, such as a line break.
             }
-            let x0 = (r[0] - vx) * sx;
-            let y0 = (r[1] - vy) * sy;
-            let x1 = (r[0] + r[2] - vx) * sx;
-            let y1 = (r[1] + r[3] - vy) * sy;
-            blend_rect(rgba, out_w, out_h, [x0, y0, x1, y1], [40, 120, 255], 0.38);
+            let (gx0, gy0, gx1, gy1) = (r[0], r[1], r[0] + r[2], r[1] + r[3]);
+            match span.as_mut() {
+                // Same line (baselines within half a character height) and near enough to be a
+                // continuation — the tolerance covers inter-word spaces, which look wrong left
+                // unhighlighted mid-selection.
+                Some(sp)
+                    if (gy0 - sp[1]).abs() < r[3] * 0.5 && gx0 <= sp[2] + r[3] && gx1 >= sp[0] =>
+                {
+                    sp[1] = sp[1].min(gy0);
+                    sp[2] = sp[2].max(gx1);
+                    sp[3] = sp[3].max(gy1);
+                }
+                _ => {
+                    if let Some(sp) = span {
+                        blend_span(rgba, out_w, out_h, sp, viewport);
+                    }
+                    span = Some([gx0, gy0, gx1, gy1]);
+                }
+            }
+        }
+        if let Some(sp) = span {
+            blend_span(rgba, out_w, out_h, sp, viewport);
         }
     }
     // Caret (vertical line).
@@ -1657,6 +1810,20 @@ fn overlay_selection(rgba: &mut [u8], out_w: u32, out_h: u32, viewport: [f32; 4]
     let ch = cr[3].max(8.0) * sy;
     let cw = (sx * 1.5).max(2.0);
     blend_rect(rgba, out_w, out_h, [cx, cy0, cx + cw, cy0 + ch], [255, 40, 40], 0.9);
+}
+
+/// Tint one selection span, given in page coordinates, by projecting it through `viewport` first.
+fn blend_span(rgba: &mut [u8], out_w: u32, out_h: u32, span: [f32; 4], viewport: [f32; 4]) {
+    let [vx, vy, vw, vh] = viewport;
+    let sx = out_w as f32 / vw.max(1.0);
+    let sy = out_h as f32 / vh.max(1.0);
+    let rect = [
+        (span[0] - vx) * sx,
+        (span[1] - vy) * sy,
+        (span[2] - vx) * sx,
+        (span[3] - vy) * sy,
+    ];
+    blend_rect(rgba, out_w, out_h, rect, [40, 120, 255], 0.38);
 }
 
 /// Alpha-blend `color` into the rect [x0,y0,x1,y1] (output pixels) with coefficient `a`.
@@ -1750,11 +1917,13 @@ struct FrameCache {
 }
 
 impl FrameCache {
-    /// Hold the current page plus `PREFETCH_RADIUS` neighbors on each side, with one slot to spare
-    /// so the page being displayed isn't evicted by the last prefetch of its own neighborhood.
-    /// Each entry is a full-resolution RGBA buffer, so the cap also bounds memory — at 1792x1950
-    /// that's about 14 MB per entry.
-    const CAP: usize = 2 * PREFETCH_RADIUS + 2;
+    /// Hold the current page plus `PREFETCH_RADIUS` neighbors on each side, with room to spare.
+    ///
+    /// Eviction is oldest-first, so too thin a margin pushes out a page that is still on screen:
+    /// reading back and forth refills the neighborhood from both directions, and each refill
+    /// inserts. The spare slots absorb that. Each entry is a full-resolution RGBA buffer — about
+    /// 14 MB at 1792x1950 — so this is the memory bound as well.
+    const CAP: usize = 2 * PREFETCH_RADIUS + 4;
 
     fn get(
         &self,
@@ -1838,40 +2007,29 @@ fn render_svg_frame(
     Ok(RenderedFrame { rgba, out_w, out_h, viewport })
 }
 
-/// Same as [`render_svg_frame`] for the PDF path (pdfium).
-fn render_pdf_frame(
-    pdf: &vecview_pdf::Pdf,
-    page: usize,
-    out_w: u32,
-    out_h: u32,
-    zoom: u32,
-) -> Result<RenderedFrame> {
-    let (pw, ph) = pdf.page_size(page)?;
-    let (pw, ph) = (pw.max(1.0), ph.max(1.0));
-    let viewport = viewport_for(pw, ph, out_w, out_h, zoom, (pw / 2.0, ph / 2.0));
-    let mut rgba = pdf.render(page, viewport, out_w, out_h)?;
-    fill_letterbox(&mut rgba, out_w, out_h, viewport, pw, ph);
-    Ok(RenderedFrame { rgba, out_w, out_h, viewport })
-}
-
-/// Warm the cache with ONE not-yet-cached immediate neighbor of the current page (next first, then
-/// previous) at the current output size and zoom. Returns whether it rendered one, so the caller can
-/// keep asking across successive idle slices until everything is warm.
+/// Warm the cache with the neighbors of the current page, nearest first.
+// Each argument is a distinct piece of loop-owned state; bundling them would only obscure it.
+#[allow(clippy::too_many_arguments)]
 ///
-/// One page per call is deliberate. A page render is far more expensive than a cache-hit redraw
-/// (roughly 50 ms against 15 ms for a 1792x1950 PDF page), and it blocks the event loop, so warming
-/// the whole neighborhood in one go would make every keypress that lands mid-warm wait for all of
-/// it. Yielding after each page caps that wait at a single render.
-fn prefetch_one_neighbor(
+/// Returns whether more warming remains, so the caller can come back on a later idle slice.
+///
+/// The two source kinds differ in where the work happens. PDF pages go to the render worker, so
+/// this only posts requests and returns immediately no matter how many pages are involved; the
+/// frames arrive later as [`Msg::Rendered`]. SVG/Typst still rasterize inline on the GPU renderer,
+/// and a page render costs far more than a cache-hit redraw, so those warm exactly one page per
+/// call — a keypress landing mid-warm then waits for a single page rather than the whole
+/// neighborhood.
+fn prefetch_neighbors(
     source: &Source,
-    pdf: Option<&vecview_pdf::Pdf>,
+    worker: Option<&RenderWorker>,
     state: &ViewState,
     renderer: Option<&Renderer>,
     backend: &dyn OutputBackend,
     cache: &mut FrameCache,
+    pages: usize,
+    inflight: &mut Vec<usize>,
 ) -> bool {
     let (out_w, out_h) = available_area(backend.name(), state.scale);
-    let pages = current_page_count(source, pdf);
     // Nearest neighbors first, alternating forward and back, so the pages most likely to be asked
     // for next are warmed by the earliest idle slices.
     let mut targets = Vec::new();
@@ -1883,28 +2041,57 @@ fn prefetch_one_neighbor(
             targets.push(state.page - d);
         }
     }
+    // PDF: post every page that is neither warm nor already asked for, then we're done. Posting is
+    // just a channel send, so the whole neighborhood costs nothing on this thread.
+    if let Some(w) = worker {
+        for p in targets {
+            let Some(mt) = page_mtime(source, p) else { continue };
+            if cache.get(p, mt, out_w, out_h, state.zoom).is_some() || inflight.contains(&p) {
+                continue;
+            }
+            inflight.push(p);
+            w.prefetch(ViewRequest {
+                page: p,
+                zoom: state.zoom,
+                // Page-centered and unfitted: exactly the view a plain page flip lands on, which is
+                // what makes the result reusable from the cache.
+                center: None,
+                fit: None,
+                out_w,
+                out_h,
+                mtime: mt,
+                cacheable: true,
+            });
+        }
+        return false;
+    }
+
+    // SVG/Typst: rasterize one page inline and report whether to come back for the rest.
     for p in targets {
         let Some(mt) = page_mtime(source, p) else { continue };
         if cache.get(p, mt, out_w, out_h, state.zoom).is_some() {
             continue;
         }
-        let frame = match source {
-            Source::Pdf { .. } => match pdf {
-                Some(doc) => render_pdf_frame(doc, p, out_w, out_h, state.zoom),
-                None => continue,
-            },
-            _ => {
-                let path = source.page_path(p);
-                if !path.exists() {
-                    continue;
-                }
-                let Some(r) = renderer else { continue };
-                render_svg_frame(&path, r, out_w, out_h, state.zoom)
-            }
-        };
-        match frame {
+        // VECVIEW_TIMING: time each warmed page, so the log shows whether a flip that had to render
+        // live was one the prefetch simply hadn't reached yet.
+        let t0 = std::env::var_os("VECVIEW_TIMING")
+            .is_some()
+            .then(std::time::Instant::now);
+        let path = source.page_path(p);
+        if !path.exists() {
+            continue;
+        }
+        let Some(r) = renderer else { continue };
+        match render_svg_frame(&path, r, out_w, out_h, state.zoom) {
             Ok(f) => {
                 cache.insert(p, mt, state.zoom, f);
+                if let Some(t0) = t0 {
+                    eprintln!(
+                        "vv-timing prefetch page {} = {:.1} ms",
+                        p + 1,
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
                 // Hand control back to the event loop; the next idle slice takes the following page.
                 return true;
             }
@@ -1925,13 +2112,14 @@ fn prefetch_one_neighbor(
 #[allow(clippy::too_many_arguments)]
 fn render_current(
     source: &Source,
-    pdf: Option<&vecview_pdf::Pdf>,
+    worker: Option<&mut RenderWorker>,
     state: &mut ViewState,
     renderer: Option<&Renderer>,
     backend: &dyn OutputBackend,
     last_render: &mut Option<(usize, SystemTime)>,
     base: &mut Option<BaseFrame>,
     cache: &mut FrameCache,
+    display_seq: &mut u64,
 ) {
     // VECVIEW_TIMING: time the whole draw so a cache hit (display only) can be compared against a
     // miss (parse + rasterize + display). The backend's display() logs its own slice separately.
@@ -1940,13 +2128,18 @@ fn render_current(
         .then(std::time::Instant::now);
     let (out_w, out_h) = available_area(backend.name(), state.scale);
     let is_pdf = matches!(source, Source::Pdf { .. });
-    // A fresh, page-centered render is fully determined by the cache key, so it can be served from
-    // and stored in the cache. Panning/zoom-in-progress (center set), a pending fit, and copy mode
-    // depend on extra state, so they bypass the cache.
-    let cacheable = state.center.is_none() && state.pending_fit.is_none() && state.copy.is_none();
+    // A fresh, page-centered render is fully determined by the cache key. Panning/zoom-in-progress
+    // (center set) and a pending fit depend on extra state, so they bypass the cache.
+    //
+    // Serving and storing differ over copy mode. It can't be served a cached frame directly because
+    // the selection has to be overlaid first, but what would be *stored* is the clean page image,
+    // which copy mode doesn't alter. Excluding it from storage as well used to mean re-rasterizing
+    // the page on entering copy mode, on every flip made while in it, and again on the way out.
+    let servable = state.center.is_none() && state.pending_fit.is_none() && state.copy.is_none();
+    let cacheable = state.center.is_none() && state.pending_fit.is_none();
     let mtime = page_mtime(source, state.page);
 
-    if cacheable {
+    if servable {
         if let Some(mt) = mtime {
             if let Some(frame) = cache.get(state.page, mt, out_w, out_h, state.zoom) {
                 let vp = frame.viewport;
@@ -1973,11 +2166,69 @@ fn render_current(
         }
     }
 
-    // Cache miss (or a non-cacheable view): render live.
-    let result = if is_pdf {
-        let Some(doc) = pdf else { return };
-        render_pdf(doc, backend, state, base)
-    } else {
+    // Copy mode changes only the overlay, not the page image, so a cached frame can serve as the
+    // clean base instead of rasterizing the same page again — that re-render is pure latency
+    // between the keypress and the caret appearing, and copy mode pays it on every page flip too.
+    //
+    // Reuse is safe in two cases: the view is page-centered (`center` unset — what a page flip
+    // leaves behind, and cached frames are rendered exactly that way), or the cached viewport
+    // matches what's on screen. A pan or zoom fails both, and the normal path below then produces a
+    // frame that matches the current view.
+    if state.copy.is_some() && state.pending_fit.is_none() {
+        if let Some(mt) = mtime {
+            let hit = cache
+                .get(state.page, mt, out_w, out_h, state.zoom)
+                .filter(|f| state.center.is_none() || state.last_viewport == Some(f.viewport));
+            if let Some(frame) = hit {
+                let (fw, fh, vp) = (frame.out_w, frame.out_h, frame.viewport);
+                let clean = frame.rgba.clone();
+                // Adopt the viewport before overlaying: mouse-to-glyph mapping reads it, so leaving
+                // the previous page's viewport in place would land clicks on the wrong characters.
+                state.last_vw = vp[2];
+                state.last_vh = vp[3];
+                state.center = Some((vp[0] + vp[2] / 2.0, vp[1] + vp[3] / 2.0));
+                state.last_viewport = Some(vp);
+                let mut shown = clean.clone();
+                if let Some(cm) = &state.copy {
+                    overlay_selection(&mut shown, fw, fh, vp, cm);
+                }
+                *base = Some(BaseFrame { out_w: fw, out_h: fh, viewport: vp, rgba: clean });
+                if let Err(e) = backend.display(&shown, fw, fh) {
+                    eprintln!("vecview: render error: {e:#}");
+                }
+                if let Some(t0) = t0 {
+                    eprintln!(
+                        "vv-timing draw page {} = {:.1} ms (copy overlay, cache hit)",
+                        state.page + 1,
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                return;
+            }
+        }
+    }
+
+    // Cache miss (or a non-cacheable view). PDF is handed to the worker and drawn when the frame
+    // comes back as `Msg::Rendered`; the point of the worker is that this returns immediately and
+    // the loop stays free to read input while the page rasterizes.
+    if is_pdf {
+        let Some(w) = worker else { return };
+        *display_seq = w.show(ViewRequest {
+            page: state.page,
+            zoom: state.zoom,
+            center: state.center,
+            // Taken, not copied: the fit is consumed by this request and applied to the frame that
+            // comes back, matching how the synchronous path consumed it.
+            fit: state.pending_fit.take(),
+            out_w,
+            out_h,
+            mtime: mtime.unwrap_or(SystemTime::UNIX_EPOCH),
+            cacheable,
+        });
+        return;
+    }
+
+    let result = {
         let path = source.page_path(state.page);
         if !path.exists() {
             return;
@@ -2009,55 +2260,82 @@ fn render_current(
     }
 }
 
-/// Have pdfium rasterize the PDF's current page at the zoom/pan-state viewport and display it.
-fn render_pdf(
-    pdf: &vecview_pdf::Pdf,
-    backend: &dyn OutputBackend,
+/// Report the VECVIEW_TIMING startup figure the first time a page reaches the screen, then disarm
+/// it. Taken at that point rather than after the initial draw call because the PDF path's first
+/// frame is rasterized off-thread and isn't on screen when that call returns.
+fn report_startup(at: &mut Option<Instant>) {
+    let Some(t0) = at.take() else { return };
+    if std::env::var_os("VECVIEW_TIMING").is_some() {
+        eprintln!(
+            "vv-timing startup (launch -> first page on screen) = {:.1} ms",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
+/// Take a frame back from the render worker. Returns whether it was put on screen.
+///
+/// It goes into the cache either way — the page is likely to be revisited — but it is only put on
+/// screen when it still matches the view we're on. A frame whose request has been superseded (the
+/// user flipped again while it rasterized) would otherwise flash a page already moved past.
+///
+/// The caller must take the returned value as the answer to "did this frame reach the screen"
+/// rather than re-deriving it: treating a frame that was dropped here as drawn would cancel the
+/// pending redraw for the page actually in view, leaving the display stuck on the previous one.
+fn accept_rendered(
+    frame: RenderedPage,
     state: &mut ViewState,
+    backend: &dyn OutputBackend,
     base: &mut Option<BaseFrame>,
-) -> Result<RenderedFrame> {
-    let (pw, ph) = pdf.page_size(state.page)?;
-    let (pw, ph) = (pw.max(1.0), ph.max(1.0));
+    cache: &mut FrameCache,
+    display_seq: u64,
+) -> bool {
+    let RenderedPage {
+        page,
+        rgba,
+        out_w,
+        out_h,
+        viewport,
+        zoom,
+        mtime,
+        cacheable,
+        for_display,
+        seq,
+    } = frame;
 
-    // The output is always the pane (display area) size. Zoom is expressed by the size of the
-    // viewport rect.
-    let (out_w, out_h) = available_area(backend.name(), state.scale);
-
-    // If there's a content-fit request, compute zoom/center from the content boundary and delegate
-    // to the normal viewport computation.
-    if let Some(fit) = state.pending_fit.take() {
-        if let Some(bbox) = pdf.content_bbox(state.page) {
-            apply_fit(fit, bbox, pw, ph, out_w, out_h, state);
+    let showable = for_display && seq == display_seq && page == state.page;
+    if showable {
+        // A fit request is resolved on the worker (it needs the content box), so the zoom it
+        // settled on is authoritative here.
+        state.zoom = zoom;
+        state.last_vw = viewport[2];
+        state.last_vh = viewport[3];
+        state.center = Some((viewport[0] + viewport[2] / 2.0, viewport[1] + viewport[3] / 2.0));
+        state.last_viewport = Some(viewport);
+        let shown = match &state.copy {
+            // In copy mode keep the clean base for later caret moves, and overlay the selection on
+            // a throwaway clone.
+            Some(cm) => {
+                *base = Some(BaseFrame { out_w, out_h, viewport, rgba: rgba.clone() });
+                let mut s = rgba.clone();
+                overlay_selection(&mut s, out_w, out_h, viewport, cm);
+                Some(s)
+            }
+            None => None,
+        };
+        let result = match &shown {
+            Some(s) => backend.display(s, out_w, out_h),
+            None => backend.display(&rgba, out_w, out_h),
+        };
+        if let Err(e) = result {
+            eprintln!("vecview: render error: {e:#}");
         }
     }
 
-    let center = state.center.unwrap_or((pw / 2.0, ph / 2.0));
-    let viewport = viewport_for(pw, ph, out_w, out_h, state.zoom, center);
-    state.last_vw = viewport[2];
-    state.last_vh = viewport[3];
-    state.center = Some((viewport[0] + viewport[2] / 2.0, viewport[1] + viewport[3] / 2.0));
-    state.last_viewport = Some(viewport);
-
-    let mut rgba = pdf.render(state.page, viewport, out_w, out_h)?;
-    // pdfium fills the entire bitmap (including the letterbox outside the page) with the white
-    // clear_color, so fitting a tall page into a wide pane leaves white bands on the sides that are
-    // indistinguishable from the page's white and look like "extra left-right margin." Repaint
-    // outside the page with the same dark color as the SVG/Typst renderer to make the page
-    // boundary visible.
-    fill_letterbox(&mut rgba, out_w, out_h, viewport, pw, ph);
-    // While in copy mode, cache the base before applying the overlay (reused across subsequent caret moves).
-    if state.copy.is_some() {
-        *base = Some(BaseFrame { out_w, out_h, viewport, rgba: rgba.clone() });
+    if cacheable {
+        cache.insert(page, mtime, zoom, RenderedFrame { rgba, out_w, out_h, viewport });
     }
-    if let Some(cm) = &state.copy {
-        // Copy mode overlays the selection on a throwaway clone, keeping `rgba` as the clean base.
-        let mut shown = rgba.clone();
-        overlay_selection(&mut shown, out_w, out_h, viewport, cm);
-        backend.display(&shown, out_w, out_h)?;
-    } else {
-        backend.display(&rgba, out_w, out_h)?;
-    }
-    Ok(RenderedFrame { rgba, out_w, out_h, viewport })
+    showable
 }
 
 /// Fill outside the page (the letterbox) with a dark color. Because pdfium paints even outside the
@@ -2749,9 +3027,17 @@ fn content_bbox(page: &Page) -> Option<[f32; 4]> {
         .then_some([min_x, min_y, max_x - min_x, max_y - min_y])
 }
 
-/// Set `state`'s zoom/center to fit the content boundary `bbox`. Width = full left-right,
-/// Height = full top-bottom. zoom is computed as a ratio relative to the fit factor (s0=100%) and clamped to range.
-fn apply_fit(fit: Fit, bbox: [f32; 4], pw: f32, ph: f32, out_w: u32, out_h: u32, state: &mut ViewState) {
+/// Zoom and center that fit the content boundary `bbox`. Width = full left-right, Height = full
+/// top-bottom. Zoom is computed as a ratio relative to the fit factor (s0=100%) and clamped to
+/// range. Kept free of `ViewState` so the render worker, which has no view state, can fit too.
+pub(crate) fn fit_zoom_center(
+    fit: Fit,
+    bbox: [f32; 4],
+    pw: f32,
+    ph: f32,
+    out_w: u32,
+    out_h: u32,
+) -> (u32, (f32, f32)) {
     let [bx, by, bw, bh] = bbox;
     let bw = bw.max(1.0);
     let bh = bh.max(1.0);
@@ -2761,8 +3047,17 @@ fn apply_fit(fit: Fit, bbox: [f32; 4], pw: f32, ph: f32, out_w: u32, out_h: u32,
         Fit::Height => out_h as f32 / bh,
     };
     let zoom = ((s / s0) * 100.0).round();
-    state.zoom = (zoom as i64).clamp(ZOOM_MIN as i64, ZOOM_MAX as i64) as u32;
-    state.center = Some((bx + bw / 2.0, by + bh / 2.0));
+    (
+        (zoom as i64).clamp(ZOOM_MIN as i64, ZOOM_MAX as i64) as u32,
+        (bx + bw / 2.0, by + bh / 2.0),
+    )
+}
+
+/// Set `state`'s zoom/center to fit the content boundary `bbox`.
+fn apply_fit(fit: Fit, bbox: [f32; 4], pw: f32, ph: f32, out_w: u32, out_h: u32, state: &mut ViewState) {
+    let (zoom, center) = fit_zoom_center(fit, bbox, pw, ph, out_w, out_h);
+    state.zoom = zoom;
+    state.center = Some(center);
 }
 
 /// Print the sizes the terminal reports and the render resolution derived from them, then exit (for investigating resolution).
