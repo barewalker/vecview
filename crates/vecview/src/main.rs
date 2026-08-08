@@ -234,6 +234,9 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    // Seed the rendering/terminal variables from the config file before anything reads them (each
+    // reader caches its first lookup). Still single-threaded here, as `set_var` requires.
+    apply_config_env();
     let scale = resolve_scale(args.scale);
     // Output backend: CLI argument > VECVIEW_BACKEND environment variable (auto-detected if unset).
     let backend_choice = args
@@ -446,14 +449,8 @@ fn main() -> Result<()> {
         &mut base_frame,
         &mut cache,
     );
-    prefetch_neighbors(
-        &source,
-        pdf_doc.as_ref(),
-        &state,
-        renderer.as_ref(),
-        backend.as_ref(),
-        &mut cache,
-    );
+    // The neighbors are warmed by the idle prefetch in the loop below (`pending_prefetch` starts
+    // set), not here, so startup shows the first page without first rendering pages nobody asked for.
 
     // tmux passthrough sixel gets cleared by tmux, so we time out the input wait and periodically
     // resend the most recent frame to restore it. The interval is VECVIEW_REDRAW_MS (default
@@ -481,6 +478,7 @@ fn main() -> Result<()> {
     let mut last_draw: Option<Instant> = None;
     let mut pending_full = false; // A full redraw (GPU re-rasterization) is pending.
     let mut pending_overlay = false; // A lightweight overlay redraw is pending.
+    let mut pending_prefetch = true; // Neighbor pages want warming once input goes quiet.
     let mut last_sixel = Instant::now(); // Previous time of the periodic sixel redraw.
 
     // With tmux placeholder kitty, switching to another window leaves the image stuck in the
@@ -519,6 +517,14 @@ fn main() -> Result<()> {
                 let remaining = vp.saturating_sub(Instant::now().duration_since(last_vis_poll));
                 w = Some(w.map_or(remaining, |x| x.min(remaining)));
             }
+            // A pending prefetch wakes us a little after the last draw. Held/repeated flips keep
+            // arriving faster than this, so they never hit the timeout and never pay for a prefetch.
+            if pending_prefetch && can_attempt_draw {
+                let remaining = last_draw
+                    .map(|t| PREFETCH_IDLE.saturating_sub(Instant::now().duration_since(t)))
+                    .unwrap_or(Duration::ZERO);
+                w = Some(w.map_or(remaining, |x| x.min(remaining)));
+            }
             w
         };
 
@@ -543,6 +549,9 @@ fn main() -> Result<()> {
         let mut help_changed = false; // Help visibility was toggled.
 
         let pages = current_page_count(&source, pdf_doc.as_ref());
+        // Whether this iteration woke on a message rather than on the wait deadline. The idle
+        // prefetch below only runs on a timeout, i.e. once input has actually stopped.
+        let had_input = !msgs.is_empty();
         for m in msgs {
             match m {
                 Msg::Quit => {
@@ -831,21 +840,38 @@ fn main() -> Result<()> {
                 last_draw = Some(now);
                 pending_full = false;
                 pending_overlay = false;
-                // The current page is on screen; warm the cache for the neighbors so the next flip
-                // is a cache hit. Runs in the idle gap, so it doesn't delay this frame. Skipped in
+                // The current page is on screen, so the neighbors are worth warming — but only once
+                // input goes quiet (see the idle-prefetch block below). Rasterizing them here would
+                // run before the next message is read, so during a held or repeated page flip it
+                // adds a full page render to every flip instead of filling an idle gap. Skipped in
                 // copy mode (a lightweight overlay redraw takes the branch above, not a full draw).
                 if full_drawn && state.copy.is_none() {
-                    prefetch_neighbors(
-                        &source,
-                        pdf_doc.as_ref(),
-                        &state,
-                        renderer.as_ref(),
-                        backend.as_ref(),
-                        &mut cache,
-                    );
+                    pending_prefetch = true;
                 }
             }
             // If not can_draw, leave it pending. The wait deadline will wake us, so it's drawn next iteration.
+        }
+
+        // Idle prefetch: input has stopped and nothing is waiting to be drawn, so warm ONE neighbor
+        // page. Doing a single page per idle slice is what keeps the loop responsive — a keypress
+        // arriving mid-warm waits for one page render, not for the whole neighborhood — and further
+        // idle slices finish the rest.
+        if pending_prefetch
+            && !had_input
+            && !pending_full
+            && !pending_overlay
+            && !state.help
+            && state.copy.is_none()
+            && last_draw.is_none_or(|t| Instant::now().duration_since(t) >= PREFETCH_IDLE)
+        {
+            pending_prefetch = prefetch_one_neighbor(
+                &source,
+                pdf_doc.as_ref(),
+                &state,
+                renderer.as_ref(),
+                backend.as_ref(),
+                &mut cache,
+            );
         }
 
         // Periodic sixel redraw (restoring an image cleared by tmux). At the refresh interval,
@@ -1063,6 +1089,11 @@ enum Action {
     ExportPdf,
 }
 
+/// How long input must stay quiet after a draw before a neighbor page is warmed. Comfortably longer
+/// than the throttled flip interval, so a held or repeated page flip keeps arriving before this
+/// deadline and never pays for a prefetch between frames.
+const PREFETCH_IDLE: Duration = Duration::from_millis(120);
+
 /// Zoom factor (%). The minimum is fit (100), the maximum is 16x.
 const ZOOM_MIN: u32 = 100;
 const ZOOM_MAX: u32 = 1600;
@@ -1133,23 +1164,32 @@ impl Keymap {
     }
 }
 
+/// The parsed config file, read at most once. `None` if it doesn't exist or fails to parse.
+fn config_table() -> Option<&'static toml::Table> {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Option<toml::Table>> = OnceLock::new();
+    TABLE
+        .get_or_init(|| {
+            let path = config_path()?;
+            let text = std::fs::read_to_string(&path).ok()?;
+            match text.parse::<toml::Table>() {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    eprintln!("vecview: config file parse error ({}): {e}", path.display());
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
 /// Read "config name -> sequence of key strings" from `[keys]` in the config file. Empty (defaults only) if it doesn't exist or fails to parse.
 fn read_key_overrides() -> std::collections::HashMap<String, Vec<String>> {
     let mut out = std::collections::HashMap::new();
-    let Some(path) = config_path() else {
-        return out;
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return out;
-    };
-    let table = match text.parse::<toml::Table>() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("vecview: config file parse error ({}): {e}", path.display());
-            return out;
-        }
-    };
-    let Some(keys) = table.get("keys").and_then(|v| v.as_table()) else {
+    let Some(keys) = config_table()
+        .and_then(|t| t.get("keys"))
+        .and_then(|v| v.as_table())
+    else {
         return out;
     };
     for (action, val) in keys {
@@ -1173,6 +1213,103 @@ fn config_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
     Some(base.join("vecview").join("config.toml"))
+}
+
+/// Config entries that back an environment variable: (section, key, env var). These are the
+/// rendering/terminal knobs; `[keys]` is handled separately by `read_key_overrides`.
+const CONFIG_ENV: &[(&str, &str, &str)] = &[
+    ("render", "backend", "VECVIEW_BACKEND"),
+    ("render", "scale", "VECVIEW_SCALE"),
+    ("render", "aa_ss", "VECVIEW_AA_SS"),
+    ("render", "md_page", "VECVIEW_MD_PAGE"),
+    ("render", "pdfium_lib", "VECVIEW_PDFIUM_LIB"),
+    ("terminal", "cell_px", "VECVIEW_CELL_PX"),
+    ("terminal", "min_frame_ms", "VECVIEW_MIN_FRAME_MS"),
+    ("terminal", "redraw_ms", "VECVIEW_REDRAW_MS"),
+    ("terminal", "vis_poll_ms", "VECVIEW_VIS_POLL_MS"),
+    ("terminal", "sixel_native", "VECVIEW_SIXEL_NATIVE"),
+];
+
+/// Render a config value as an environment-variable string. `None` for values that shouldn't set
+/// the variable at all.
+fn config_value_to_env(v: &toml::Value) -> Option<String> {
+    match v {
+        toml::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+        toml::Value::Integer(i) => Some(i.to_string()),
+        toml::Value::Float(f) => Some(f.to_string()),
+        // Flag-style variables are presence-tested, so only `true` sets one; `false` must leave it
+        // unset rather than set it to something falsy-looking.
+        toml::Value::Boolean(b) => b.then(|| "1".to_string()),
+        _ => None,
+    }
+}
+
+/// Whether an environment variable counts as set for precedence purposes. The empty string counts
+/// as unset: the `vv()` shell wrapper passes `VECVIEW_CELL_PX=""` to mean "auto-detect", and that
+/// must not mask the config file.
+fn env_is_set(var: &str) -> bool {
+    std::env::var_os(var).is_some_and(|v| !v.is_empty())
+}
+
+/// Fill in the rendering/terminal environment variables from the config file, for those the
+/// environment doesn't already set.
+///
+/// Precedence is CLI argument > environment variable > config file > built-in default. The
+/// environment adapts to the context of a single run (SSH, tmux, herdr — each needs a different
+/// cell size and frame interval), while the config file holds the standing preference, so the
+/// environment has to take priority or that per-run adaptation stops working.
+///
+/// Implemented by injecting into the environment rather than threading a config struct through the
+/// crates: every reader (`cell_px`, `aa_supersample`, …) caches its lookup in a `OnceLock`, so
+/// seeding the variables before the first read makes the config apply with no changes downstream.
+/// Must be called at the top of `main` while still single-threaded, since `set_var` is not
+/// thread-safe.
+fn apply_config_env() {
+    let Some(table) = config_table() else {
+        return;
+    };
+    warn_unknown_config_keys(table);
+    for (section, key, var) in CONFIG_ENV {
+        if env_is_set(var) {
+            continue;
+        }
+        let Some(val) = table
+            .get(*section)
+            .and_then(|s| s.as_table())
+            .and_then(|s| s.get(*key))
+        else {
+            continue;
+        };
+        if let Some(s) = config_value_to_env(val) {
+            std::env::set_var(var, s);
+        }
+    }
+}
+
+/// Warn about sections and keys the config file defines but vecview doesn't read, so a typo fails
+/// loudly instead of being silently ignored.
+fn warn_unknown_config_keys(table: &toml::Table) {
+    for (section, val) in table {
+        if section == "keys" {
+            continue;
+        }
+        let Some(sub) = val.as_table() else {
+            eprintln!("vecview: config: ignoring top-level `{section}` (expected a [section])");
+            continue;
+        };
+        if !CONFIG_ENV.iter().any(|(s, _, _)| s == section) {
+            eprintln!("vecview: config: ignoring unknown section [{section}]");
+            continue;
+        }
+        for key in sub.keys() {
+            if !CONFIG_ENV
+                .iter()
+                .any(|(s, k, _)| s == section && k == key)
+            {
+                eprintln!("vecview: config: ignoring unknown key `{key}` in [{section}]");
+            }
+        }
+    }
 }
 
 /// Parse a key-spec string into (KeyCode, whether Ctrl). E.g. "q", "+", "left", "space", "ctrl+c".
@@ -1710,18 +1847,22 @@ fn render_pdf_frame(
     Ok(RenderedFrame { rgba, out_w, out_h, viewport })
 }
 
-/// Warm the cache with the immediate neighbors of the current page (next first, then previous) at
-/// the current output size and zoom. Runs after a page is shown, so the cost is paid in the idle
-/// gap before the next keypress; the following flip then hits the cache and skips rasterization.
-/// Only renders pages not already cached.
-fn prefetch_neighbors(
+/// Warm the cache with ONE not-yet-cached immediate neighbor of the current page (next first, then
+/// previous) at the current output size and zoom. Returns whether it rendered one, so the caller can
+/// keep asking across successive idle slices until everything is warm.
+///
+/// One page per call is deliberate. A page render is far more expensive than a cache-hit redraw
+/// (roughly 50 ms against 15 ms for a 1792x1950 PDF page), and it blocks the event loop, so warming
+/// the whole neighborhood in one go would make every keypress that lands mid-warm wait for all of
+/// it. Yielding after each page caps that wait at a single render.
+fn prefetch_one_neighbor(
     source: &Source,
     pdf: Option<&vecview_pdf::Pdf>,
     state: &ViewState,
     renderer: Option<&Renderer>,
     backend: &dyn OutputBackend,
     cache: &mut FrameCache,
-) {
+) -> bool {
     let (out_w, out_h) = available_area(backend.name(), state.scale);
     let pages = current_page_count(source, pdf);
     let mut targets = Vec::new();
@@ -1750,10 +1891,17 @@ fn prefetch_neighbors(
                 render_svg_frame(&path, r, out_w, out_h, state.zoom)
             }
         };
-        if let Ok(f) = frame {
-            cache.insert(p, mt, state.zoom, f);
+        match frame {
+            Ok(f) => {
+                cache.insert(p, mt, state.zoom, f);
+                // Hand control back to the event loop; the next idle slice takes the following page.
+                return true;
+            }
+            // Give up on a page that fails to render rather than retrying it every idle slice.
+            Err(_) => return false,
         }
     }
+    false
 }
 
 /// Render and display the current page. PDF via pdfium, SVG/Typst via the GPU renderer.
@@ -2612,6 +2760,29 @@ fn probe_and_exit(backend: Option<&str>, scale: u32) -> ! {
     println!("backend            = {}", b.name());
     println!("scale (SS factor)  = {scale}");
     println!("TMUX env           = {}", std::env::var_os("TMUX").is_some());
+    match config_path() {
+        Some(p) if config_table().is_some() => println!("config file        = {} (loaded)", p.display()),
+        Some(p) => println!("config file        = {} (absent or unparseable)", p.display()),
+        None => println!("config file        = none (no HOME/XDG_CONFIG_HOME)"),
+    }
+    // Effective values after the config file has been folded in, so this shows what actually applies.
+    let effective: Vec<String> = CONFIG_ENV
+        .iter()
+        .filter_map(|(_, _, var)| {
+            std::env::var(var)
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(|v| format!("{var}={v}"))
+        })
+        .collect();
+    println!(
+        "effective settings = {}",
+        if effective.is_empty() {
+            "(all defaults)".to_string()
+        } else {
+            effective.join(" ")
+        }
+    );
     match crossterm::terminal::window_size() {
         Ok(ws) => {
             println!(

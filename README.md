@@ -204,20 +204,54 @@ sixel:
 set -as terminal-features '*:sixel'
 ```
 
+### Configuration file
+
+`config.toml` holds your standing preferences, so you don't have to export
+environment variables from a shell rc. Its path is `VECVIEW_CONFIG` >
+`$XDG_CONFIG_HOME/vecview/config.toml` > `~/.config/vecview/config.toml`, and
+it's optional — without it everything falls back to the defaults below.
+
+```toml
+[terminal]
+cell_px = "14x30"      # only consulted when the terminal doesn't report its pixel size
+
+[render]
+scale = 2
+aa_ss = 3
+
+[keys]
+next_page = ["n", "space"]
+```
+
+**Precedence: CLI argument > environment variable > config file > built-in
+default.** The environment ranks above the file because it carries per-run
+context — SSH, tmux and a terminal multiplexer each need a different cell size
+and frame interval, and a shell wrapper that detects this at launch has to be
+able to override the standing preference. (An environment variable set to the
+empty string counts as unset, so a wrapper can pass `VECVIEW_CELL_PX=""` to mean
+"auto-detect" without masking the config file.)
+
+Unknown sections and keys are reported on stderr rather than silently ignored,
+so a typo is visible. `VECVIEW_PROBE=1` prints the config path, whether it
+loaded, and the effective settings after the file has been folded in.
+
 ### Environment variables
 
-| Variable | Default | Description |
-|---|---|---|
-| `VECVIEW_BACKEND` | auto-detect | Force a backend `[kitty\|tmux\|sixel\|framebuffer]` |
-| `VECVIEW_AA_SS` | `2` | Internal supersampling for SVG/Typst/Markdown anti-aliasing (1..=4). The scene is rendered at this multiple and downsampled back, sharpening text/curve edges **without** enlarging the transferred image. `1` disables it (faster, but jaggier). Independent of `-s` |
-| `VECVIEW_MD_PAGE` | `a4` | Page geometry for Markdown. A typst paper name (e.g. `a4`, `us-letter`) paginates long documents into pages you flip with `j`/`k`; `auto` makes one continuous (scroll-only) page |
-| `VECVIEW_SCALE` | `1` | Transfer-resolution supersampling factor (1..=4). Also settable with `-s`. Sends a larger image for the terminal to downscale; sharper but transfer size grows with the square of the factor (can destabilize tmux/sixel) |
-| `VECVIEW_CELL_PX` | auto | Manual override of the terminal cell size `WxH`. Normally auto-detected (`TIOCGWINSZ`, or a `CSI 16t` query that works through tmux); set this only if detection is wrong or unavailable |
-| `VECVIEW_MIN_FRAME_MS` | `200` (over tmux) / `80` (direct) | Minimum interval (ms) between image transfers during continuous input. Smaller is smoother but becomes unstable if it outruns the terminal |
-| `VECVIEW_REDRAW_MS` | `1000` | Resend interval (ms) to restore tmux passthrough sixel after a tmux redraw |
-| `VECVIEW_VIS_POLL_MS` | `0` (off) | Interval (ms) for polling tmux window visibility (kitty placeholder path). Off by default because each tick spawns a `tmux` subprocess that makes tmux refresh the client — pinning a CPU core even while idle. Set `>0` only if you want the image cleared when switching tmux windows and your terminal tolerates the redraw |
-| `VECVIEW_SIXEL_NATIVE` | off | `1` to attempt tmux native sixel (requires sixel in `client_termfeatures`) |
-| `VECVIEW_PROBE` | off | `1` to print the size reported by the terminal and the render resolution, then exit (for resolution debugging) |
+Each variable below has a matching config key, shown in the third column.
+
+| Variable | Default | Config key | Description |
+|---|---|---|---|
+| `VECVIEW_BACKEND` | auto-detect | `render.backend` | Force a backend `[kitty\|tmux\|sixel\|framebuffer]` |
+| `VECVIEW_AA_SS` | `2` | `render.aa_ss` | Internal supersampling for SVG/Typst/Markdown anti-aliasing (1..=4). The scene is rendered at this multiple and downsampled back, sharpening text/curve edges **without** enlarging the transferred image. `1` disables it (faster, but jaggier). Independent of `-s` |
+| `VECVIEW_MD_PAGE` | `a4` | `render.md_page` | Page geometry for Markdown. A typst paper name (e.g. `a4`, `us-letter`) paginates long documents into pages you flip with `j`/`k`; `auto` makes one continuous (scroll-only) page |
+| `VECVIEW_SCALE` | `1` | `render.scale` | Transfer-resolution supersampling factor (1..=4). Also settable with `-s`. Sends a larger image for the terminal to downscale; sharper but transfer size grows with the square of the factor (can destabilize tmux/sixel) |
+| `VECVIEW_PDFIUM_LIB` | auto | `render.pdfium_lib` | Explicit path to `libpdfium.so`. Searched at `~/.local/lib/libpdfium.so` then the system paths if unset |
+| `VECVIEW_CELL_PX` | auto | `terminal.cell_px` | Manual override of the terminal cell size `WxH`. Normally auto-detected (`TIOCGWINSZ`, or a `CSI 16t` query that works through tmux); set this only if detection is wrong or unavailable |
+| `VECVIEW_MIN_FRAME_MS` | `200` (over tmux) / `80` (direct) | `terminal.min_frame_ms` | Minimum interval (ms) between image transfers during continuous input. Smaller is smoother but becomes unstable if it outruns the terminal |
+| `VECVIEW_REDRAW_MS` | `1000` | `terminal.redraw_ms` | Resend interval (ms) to restore tmux passthrough sixel after a tmux redraw |
+| `VECVIEW_VIS_POLL_MS` | `0` (off) | `terminal.vis_poll_ms` | Interval (ms) for polling tmux window visibility (kitty placeholder path). Off by default because each tick spawns a `tmux` subprocess that makes tmux refresh the client — pinning a CPU core even while idle. Set `>0` only if you want the image cleared when switching tmux windows and your terminal tolerates the redraw |
+| `VECVIEW_SIXEL_NATIVE` | off | `terminal.sixel_native` | `1` to attempt tmux native sixel (requires sixel in `client_termfeatures`) |
+| `VECVIEW_PROBE` | off | — | `1` to print the size reported by the terminal and the render resolution, then exit (for resolution debugging) |
 
 > Note: over tmux, the terminal protocol means some terminals handle
 > high-frequency image updates poorly with Kitty / Sixel. If rapid zoom/pan
