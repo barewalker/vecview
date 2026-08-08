@@ -9,7 +9,7 @@
 //!   always end up at the top-left of the window, since tmux does not understand the pane
 //!   placement of graphics. Requires `set -g allow-passthrough on` on the tmux side.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::Write;
 
 use anyhow::Result;
@@ -30,6 +30,18 @@ fn zlib_compress(data: &[u8]) -> Vec<u8> {
 
 /// Maximum length of one chunk of the base64 payload (Kitty's recommended 4096 bytes).
 const CHUNK: usize = 4096;
+
+/// Horizontal bands the placeholder image is split into.
+///
+/// Each band is transmitted as its own image, and a redraw only resends the bands whose pixels
+/// actually changed. The redraw that matters is the caret moving through a copy-mode selection:
+/// it alters a line or two, yet used to retransmit the whole page — 2.7 MB compressed for a page
+/// with photographs, at ~22 ms of zlib per keystroke. Per-band, that becomes a fraction of it.
+///
+/// Bounded by the 4 bits the band occupies in the image ID (see [`KittyBackend::band_id`]). Finer
+/// bands localize a change better but add a transfer's worth of protocol overhead each, and 8 over
+/// a typical pane already puts a band at well under ten rows.
+const BANDS: usize = 8;
 
 /// Unicode placeholder character U+10EEEE.
 const PLACEHOLDER: char = '\u{10EEEE}';
@@ -57,6 +69,19 @@ pub struct KittyBackend {
     /// The most recent placeholder cell footprint (cols, rows). Only on a change do we clear the
     /// whole screen to sweep away the previous frame's leftover cells.
     last_footprint: RefCell<Option<(u32, u32)>>,
+    /// Image ID on screen for each band of the placeholder image, or `None` if that band has never
+    /// been sent. Indexed by band. See [`BANDS`].
+    band_live: RefCell<Vec<Option<u32>>>,
+    /// The pixels of the previous placeholder frame, kept solely to find which bands changed.
+    /// Costs one full-resolution buffer of memory and a memcmp per frame, and saves compressing
+    /// and transmitting the bands that are identical — a trade that pays off by a wide margin, as
+    /// compression dominates the frame time.
+    last_frame: RefCell<Option<Vec<u8>>>,
+    /// Bytes actually written for the frame being drawn, accumulated across bands. Reported under
+    /// VECVIEW_TIMING, where it is the number that says whether band-skipping is doing its job.
+    sent_bytes: Cell<usize>,
+    /// Bands transmitted for the frame being drawn, out of [`BANDS`].
+    sent_bands: Cell<usize>,
 }
 
 impl KittyBackend {
@@ -84,7 +109,22 @@ impl KittyBackend {
             toggle: RefCell::new(false),
             live: RefCell::new(None),
             last_footprint: RefCell::new(None),
+            band_live: RefCell::new(vec![None; BANDS]),
+            last_frame: RefCell::new(None),
+            sent_bytes: Cell::new(0),
+            sent_bands: Cell::new(0),
         }
+    }
+
+    /// Image ID for one band of the placeholder image, under buffer `toggle`.
+    ///
+    /// The ID has to fit in the 24 bits addressable by the placeholder cell's foreground color, and
+    /// now has to distinguish bands as well, so the layout is: instance (19 bits, from the PID) |
+    /// band (4 bits) | toggle (1 bit). The instance part is narrower than the single-image `base_id`
+    /// but still leaves collision between concurrent vecviews effectively impossible.
+    fn band_id(&self, band: usize, toggle: bool) -> u32 {
+        let instance = (self.base_id & 0x0007_FFFF).max(1);
+        (instance << 5) | (((band as u32) & 0xF) << 1) | u32::from(toggle)
     }
 
     /// The image ID to use for the next frame (alternating between base_id and base_id|bit23). With
@@ -113,6 +153,12 @@ impl KittyBackend {
     fn delete_own(&self, out: &mut impl Write) -> std::io::Result<()> {
         self.delete_id(out, self.base_id)?;
         self.delete_id(out, self.base_id | 0x0080_0000)?;
+        // The placeholder path addresses images per band under a different ID layout, so those have
+        // to be swept too or they outlive the session on the terminal side.
+        for band in 0..BANDS {
+            self.delete_id(out, self.band_id(band, false))?;
+            self.delete_id(out, self.band_id(band, true))?;
+        }
         Ok(())
     }
 
@@ -149,6 +195,7 @@ impl KittyBackend {
         // dramatically effective. s/v (pixel dimensions) stay at the uncompressed size. This greatly
         // reduces the amount transferred over tmux passthrough.
         let payload = STANDARD.encode(zlib_compress(rgba));
+        self.sent_bytes.set(self.sent_bytes.get() + payload.len());
         let bytes = payload.as_bytes();
         let chunks: Vec<&[u8]> = bytes.chunks(CHUNK).collect();
         let last = chunks.len().saturating_sub(1);
@@ -187,57 +234,105 @@ impl KittyBackend {
         Ok(())
     }
 
-    /// Unicode placeholder placement (tmux): transfers the image as a virtual placement and draws
-    /// placeholder cells. The cells are ordinary text, so tmux places them correctly within the pane.
+    /// Unicode placeholder placement (tmux, herdr): transfers the image as a virtual placement and
+    /// draws placeholder cells. The cells are ordinary text, so the multiplexer places them
+    /// correctly within the pane.
+    ///
+    /// The image goes out as [`BANDS`] horizontal strips, each its own kitty image, and a band whose
+    /// pixels are identical to the previous frame is skipped entirely — neither compressed nor sent,
+    /// and its cells left untouched. Compression dominates the cost of a frame, so a redraw that
+    /// changes a line or two (the caret moving through a selection) drops from the price of a whole
+    /// page to that of one strip.
     fn display_placeholder(&self, out: &mut impl Write, rgba: &[u8], w: u32, h: u32) -> std::io::Result<()> {
         let (cols, rows) = cell_footprint(w, h);
-        let new_id = self.next_id();
-        let old = *self.live.borrow();
 
         // Only when the cell footprint changes (terminal resize etc.) do we clear the whole screen
         // to sweep away the previous frame's extra cells. Normally the size is the same, so we don't
         // clear and instead overwrite the new cells in place below. Clearing the whole screen with
         // 2J every frame would leave the screen blank between erasing and the new image arriving,
         // causing flicker (transfer is especially slow over SSH+tmux).
-        if *self.last_footprint.borrow() != Some((cols, rows)) {
+        let resized = *self.last_footprint.borrow() != Some((cols, rows));
+        if resized {
             out.write_all(b"\x1b[2J\x1b[H")?;
+            // The cells are gone, so nothing on screen can be reused.
+            self.band_live.borrow_mut().iter_mut().for_each(|b| *b = None);
+            *self.last_frame.borrow_mut() = None;
         }
 
-        // Transfer the new frame as a virtual placement (U=1) under a different ID than the old
-        // frame. The old image stays displayed, so the screen doesn't go blank during transfer.
-        // c/r is the image's cell footprint. i is the instance-unique ID.
-        self.transmit(
-            out,
-            rgba,
-            &format!("a=T,q=2,U=1,i={new_id},f=32,s={w},v={h},c={cols},r={rows}"),
-        )?;
-
-        // Redraw the placeholder cells in the new ID's color (id = r<<16 | g<<8 | b). We overwrite
-        // the previous frame's cells in place, so no blank appears (we just replace, not erase).
-        let (r, g, b) = ((new_id >> 16) & 0xff, (new_id >> 8) & 0xff, new_id & 0xff);
-        write!(out, "\x1b[38;2;{r};{g};{b}m")?;
+        let stride = (w * 4) as usize;
         let mut buf = [0u8; 4];
-        for y in 0..rows {
-            // To the start of the line (in tmux this is pane-relative cursor movement).
-            write!(out, "\x1b[{};1H", y + 1)?;
-            for x in 0..cols {
-                out.write_all(PLACEHOLDER.encode_utf8(&mut buf).as_bytes())?;
-                out.write_all(diacritic(y).encode_utf8(&mut buf).as_bytes())?;
-                out.write_all(diacritic(x).encode_utf8(&mut buf).as_bytes())?;
+        for band in 0..BANDS {
+            // Split by cell rows and derive the pixel rows from them, so band edges land on cell
+            // boundaries even when the image is taller than rows*cell_h (supersampling).
+            let r0 = (rows as usize * band / BANDS) as u32;
+            let r1 = (rows as usize * (band + 1) / BANDS) as u32;
+            if r1 <= r0 {
+                continue; // Fewer rows than bands: this one is empty.
             }
-        }
-        out.write_all(b"\x1b[0m")?;
+            let y0 = (h as u64 * r0 as u64 / rows as u64) as usize;
+            let y1 = (h as u64 * r1 as u64 / rows as u64) as usize;
+            let span = y0 * stride..y1 * stride;
 
-        // Free the old image and its placement (d=I,i=oldID). The new cells no longer reference the
-        // old ID, so this doesn't affect the appearance. This keeps the images held on the terminal
-        // side at always 1-2, so even repeated redraws (e.g. mashing the caret in copy mode) won't
-        // balloon memory and crash the terminal.
-        if let Some(old_id) = old {
-            if old_id != new_id {
-                self.delete_id(out, old_id)?;
+            let old = self.band_live.borrow()[band];
+            // Unchanged pixels mean the band already on screen is still correct.
+            let unchanged = old.is_some()
+                && self
+                    .last_frame
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|p| p.len() == rgba.len() && p[span.clone()] == rgba[span.clone()]);
+            if unchanged {
+                continue;
+            }
+
+            // Alternate the ID per band so the band on screen stays displayed while its replacement
+            // transfers — the same double buffering as the single-image path, band by band.
+            let id = self.band_id(band, !matches!(old, Some(o) if o & 1 == 1));
+            self.sent_bands.set(self.sent_bands.get() + 1);
+            self.transmit(
+                out,
+                &rgba[span],
+                &format!(
+                    "a=T,q=2,U=1,i={id},f=32,s={w},v={},c={cols},r={}",
+                    y1 - y0,
+                    r1 - r0
+                ),
+            )?;
+
+            // Point this band's cells at the new ID (id = r<<16 | g<<8 | b). Row diacritics are
+            // relative to the band, since each band is a separate image starting at its own row 0.
+            let (r, g, b) = ((id >> 16) & 0xff, (id >> 8) & 0xff, id & 0xff);
+            write!(out, "\x1b[38;2;{r};{g};{b}m")?;
+            for y in r0..r1 {
+                // To the start of the line (in tmux this is pane-relative cursor movement).
+                write!(out, "\x1b[{};1H", y + 1)?;
+                for x in 0..cols {
+                    out.write_all(PLACEHOLDER.encode_utf8(&mut buf).as_bytes())?;
+                    out.write_all(diacritic(y - r0).encode_utf8(&mut buf).as_bytes())?;
+                    out.write_all(diacritic(x).encode_utf8(&mut buf).as_bytes())?;
+                }
+            }
+            out.write_all(b"\x1b[0m")?;
+
+            // Free the band's previous image now that no cell references it. Each band holds at most
+            // two images, so repeated redraws can't accumulate on the terminal side.
+            if let Some(old_id) = old {
+                if old_id != id {
+                    self.delete_id(out, old_id)?;
+                }
+            }
+            self.band_live.borrow_mut()[band] = Some(id);
+        }
+
+        // Keep this frame as the reference for the next comparison, reusing the existing allocation
+        // when the size matches (it does on every frame that isn't a resize).
+        {
+            let mut slot = self.last_frame.borrow_mut();
+            match slot.as_mut() {
+                Some(p) if p.len() == rgba.len() => p.copy_from_slice(rgba),
+                _ => *slot = Some(rgba.to_vec()),
             }
         }
-        *self.live.borrow_mut() = Some(new_id);
         *self.last_footprint.borrow_mut() = Some((cols, rows));
         Ok(())
     }
@@ -284,15 +379,21 @@ impl OutputBackend for KittyBackend {
         out.write_all(b"\x1b[2J\x1b[H")?;
         out.flush()?;
         // Since we deleted the images, reset the double-buffer state so the next display performs a
-        // clean full-clear + redraw (leaving no leftover cells or references to freed IDs).
+        // clean full-clear + redraw (leaving no leftover cells or references to freed IDs). The
+        // per-band state has to go with it: keeping it would let the next frame skip a band as
+        // "unchanged" when the image behind it no longer exists.
         *self.live.borrow_mut() = None;
         *self.last_footprint.borrow_mut() = None;
+        self.band_live.borrow_mut().iter_mut().for_each(|b| *b = None);
+        *self.last_frame.borrow_mut() = None;
         Ok(())
     }
 
     fn display(&self, rgba: &[u8], width: u32, height: u32) -> Result<()> {
         let timing = std::env::var_os("VECVIEW_TIMING").is_some();
         let t0 = timing.then(std::time::Instant::now);
+        self.sent_bytes.set(0);
+        self.sent_bands.set(0);
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
         if self.placeholder {
@@ -305,8 +406,11 @@ impl OutputBackend for KittyBackend {
         // excludes the multiplexer's async decode/composite, which happens after the bytes are sent).
         if let Some(t0) = t0 {
             eprintln!(
-                "vv-timing display {width}x{height} = {:.1} ms",
-                t0.elapsed().as_secs_f64() * 1000.0
+                "vv-timing display {width}x{height} = {:.1} ms ({}/{} bands, {} bytes sent)",
+                t0.elapsed().as_secs_f64() * 1000.0,
+                self.sent_bands.get(),
+                BANDS,
+                self.sent_bytes.get()
             );
         }
         Ok(())
