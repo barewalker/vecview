@@ -17,9 +17,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use pdfium_render::prelude::*;
 
 /// Wrapper for placing `Pdfium` into a `static` (which requires Send+Sync).
-/// SAFETY: this app uses pdfium only from the main thread (drawing happens on the main
-/// loop; the watch/key-input threads never touch pdfium). Since it is never shared
-/// across threads, asserting Send/Sync is fine.
+///
+/// SAFETY: exactly one thread ever touches pdfium. In vecview that is the render worker, which
+/// owns every document and performs every rasterization and text extraction; the main loop, the
+/// file watcher and the input reader never call into this crate. Nothing is shared across threads,
+/// so asserting Send/Sync holds — but it holds only as long as that stays true, so a second caller
+/// on another thread must not be introduced.
 struct SyncPdfium(Pdfium);
 unsafe impl Sync for SyncPdfium {}
 unsafe impl Send for SyncPdfium {}
@@ -38,11 +41,27 @@ fn pdfium() -> Result<&'static Pdfium> {
     Ok(&PDFIUM.get().unwrap().0)
 }
 
-/// Locates and binds libpdfium. Priority: the VECVIEW_PDFIUM_LIB env var > default paths > system.
+/// Locates and binds libpdfium. Priority: the VECVIEW_PDFIUM_LIB env var > a bundled copy (when
+/// built with the `bundled` feature) > default paths > system.
 fn bind() -> Result<Box<dyn PdfiumLibraryBindings>> {
     if let Some(p) = std::env::var_os("VECVIEW_PDFIUM_LIB") {
         return Pdfium::bind_to_library(PathBuf::from(&p))
             .map_err(|e| anyhow!("failed to bind VECVIEW_PDFIUM_LIB ({:?}): {e}", p));
+    }
+    // A bundled build carries a copy known to match these bindings, so prefer it over whatever
+    // happens to be installed — but still below the explicit override, which exists precisely to
+    // let someone point at a different build.
+    #[cfg(feature = "bundled")]
+    {
+        match pdfium_bundled::ensure_pdfium_bundled() {
+            Ok(path) => match Pdfium::bind_to_library(&path) {
+                Ok(b) => return Ok(b),
+                // Fall through to the search below rather than failing outright: an installed
+                // library is still a better outcome than no PDF support.
+                Err(e) => eprintln!("vecview: bundled libpdfium failed to bind ({}): {e}", path.display()),
+            },
+            Err(e) => eprintln!("vecview: bundled libpdfium unavailable: {e}"),
+        }
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
@@ -57,9 +76,22 @@ fn bind() -> Result<Box<dyn PdfiumLibraryBindings>> {
             }
         }
     }
+    // Spell out how to obtain it: pdfium is Chromium's C++ PDF library, so `cargo install` brings in
+    // the Rust bindings but never the library itself, and someone installing vecview from crates.io
+    // meets this message with no reason to expect a missing dependency.
     Pdfium::bind_to_system_library().map_err(|e| {
         anyhow!(
-            "libpdfium not found. Place it at VECVIEW_PDFIUM_LIB or ~/.local/lib/libpdfium.so: {e}"
+            "libpdfium not found — vecview needs it to draw PDFs (and to build the copy-mode text \
+             layer for Typst). It is not installed by cargo: pdfium is a C++ library distributed \
+             separately from this crate.\n\
+             \n\
+             Get a prebuilt one from https://github.com/bblanchon/pdfium-binaries/releases and \
+             either place it at ~/.local/lib/libpdfium.so or point VECVIEW_PDFIUM_LIB at it. Some \
+             distributions also package it (Arch: pdfium-binaries from the AUR).\n\
+             \n\
+             Searched: $VECVIEW_PDFIUM_LIB, ~/.local/lib/libpdfium.so, /usr/lib/libpdfium.so, \
+             /usr/local/lib/libpdfium.so, and the system library path.\n\
+             Underlying error: {e}"
         )
     })
 }
@@ -118,13 +150,8 @@ impl Pdf {
         // FS_MATRIX {a,b,c,d,e,f}: Dx = a*Px + c*Py + e, Dy = b*Px + d*Py + f.
         let (a, b, c, d, e, f) = (s, 0.0, 0.0, s, -s * vx, -s * vy);
 
-        let mut bitmap = PdfBitmap::empty(
-            out_w as i32,
-            out_h as i32,
-            PdfBitmapFormat::default(),
-            pdfium()?.bindings(),
-        )
-        .map_err(|e| anyhow!("failed to create bitmap: {e}"))?;
+        let mut bitmap = PdfBitmap::empty(out_w as i32, out_h as i32, PdfBitmapFormat::default())
+            .map_err(|e| anyhow!("failed to create bitmap: {e}"))?;
 
         let config = PdfRenderConfig::new()
             // Match the output size to the bitmap (so the clear rectangle covers the whole surface).
@@ -196,7 +223,7 @@ impl Pdf {
         }
         self.doc
             .pages()
-            .get(index as u16)
+            .get(index as i32)
             .map_err(|e| anyhow!("failed to get page: {e}"))
     }
 }

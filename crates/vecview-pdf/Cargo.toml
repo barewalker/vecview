@@ -12,4 +12,11 @@ categories.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-pdfium-render = "0.8"
+pdfium-render = "0.9"
+pdfium-bundled = { version = "0.1", optional = true, features = ["bundled"] }
+
+[features]
+# Embed libpdfium in the binary at build time, so `cargo install` alone yields a working PDF
+# path. Off by default: pdfium is a C++ library that has to be fetched from outside the crate
+# registry, and a build that reaches the network would break offline and air-gapped builds.
+bundled = ["dep:pdfium-bundled"]

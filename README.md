@@ -34,8 +34,18 @@ bitmap and gets blurry. vecview is a **renderer, not a bitmap viewer**:
 Install from [crates.io](https://crates.io/crates/vecview) with cargo:
 
 ```bash
+# Everything included — fetches libpdfium during the build and embeds it
+cargo install vecview --features bundled
+
+# Or, if you already have libpdfium installed (or don't need PDF)
 cargo install vecview
 ```
+
+`--features bundled` is the one-command route: nothing else to download, and PDF
+works out of the box. It isn't the default because it needs network access *during
+the build* (which would break offline and air-gapped builds) and takes the binary
+from 15 MB to 28 MB. See [runtime dependencies](#runtime-dependencies) if you'd
+rather supply the library yourself.
 
 Other options:
 
@@ -52,20 +62,31 @@ Prebuilt binaries (built against an older glibc for broad portability) are attac
 to each [GitHub Release](https://github.com/barewalker/vecview/releases) — download
 `vv`, `chmod +x vv`, and put it on your `PATH` if you'd rather not build it yourself.
 
-The installed command is **`vv`** (the project's full name is vecview). Note that the
-runtime dependencies below still need to be present regardless of how you install.
+The installed command is **`vv`** (the project's full name is vecview).
+
+Whichever way you install, the runtime dependencies below still have to be present.
 
 ### Runtime dependencies
 
 | Dependency | Purpose | Notes |
 |---|---|---|
-| **libpdfium** (`libpdfium.so` / `.dylib` / `.dll`) | PDF rendering and the text layer for Typst/PDF | Required. Linked and loaded by `pdfium-render` |
+| **libpdfium** (`libpdfium.so` / `.dylib` / `.dll`) | PDF rendering and the text layer for Typst/PDF | Required for PDF. Supplied automatically by `--features bundled`; otherwise install it yourself (below) |
 | **typst** | Live preview of `.typ` and `.md` files | Needed for `.typ`/`.md`. Must be on `PATH`. Markdown also uses the `cmarker` package (auto-fetched on first use; needs network once) |
 | **Vulkan driver** (Mesa RADV/ANV, etc.) | GPU rendering of SVG/Typst | Required for headless wgpu rendering |
 
 Prebuilt libpdfium binaries are available from
-[bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries).
-Place the library somewhere on your library search path (`LD_LIBRARY_PATH`, etc.).
+[bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries/releases)
+(some distributions package it too — on Arch, `pdfium-binaries` from the AUR).
+
+`vv` looks for the library at `$VECVIEW_PDFIUM_LIB`, then `~/.local/lib/libpdfium.so`,
+then the system library paths, so dropping it in your home directory is enough — no
+`LD_LIBRARY_PATH` needed:
+
+```bash
+mkdir -p ~/.local/lib
+# unpack the release archive, then:
+mv lib/libpdfium.so ~/.local/lib/
+```
 
 ## Usage
 

@@ -11,7 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-vecview-core = { path = "../vecview-core", version = "0.1.0" }
+vecview-core = { path = "../vecview-core", version = "0.2.0" }
 usvg.workspace = true
 image = "0.25"
 regex = "1"

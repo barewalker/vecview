@@ -17,11 +17,11 @@ name = "vv"
 path = "src/main.rs"
 
 [dependencies]
-vecview-core = { path = "../vecview-core", version = "0.1.0" }
-vecview-pdf = { path = "../vecview-pdf", version = "0.1.0" }
-vecview-svg = { path = "../vecview-svg", version = "0.1.0" }
-vecview-renderer = { path = "../vecview-renderer", version = "0.1.0" }
-vecview-output = { path = "../vecview-output", version = "0.1.0" }
+vecview-core = { path = "../vecview-core", version = "0.2.0" }
+vecview-pdf = { path = "../vecview-pdf", version = "0.2.0" }
+vecview-svg = { path = "../vecview-svg", version = "0.2.0" }
+vecview-renderer = { path = "../vecview-renderer", version = "0.2.0" }
+vecview-output = { path = "../vecview-output", version = "0.2.0" }
 clap.workspace = true
 anyhow.workspace = true
 notify.workspace = true
@@ -35,3 +35,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 icy_sixel = "0.5.0"
+
+[features]
+# Pass through to vecview-pdf: embed libpdfium in the binary so `cargo install vecview
+# --features bundled` needs nothing fetched by hand. See that crate for why it is opt-in.
+bundled = ["vecview-pdf/bundled"]
