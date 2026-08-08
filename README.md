@@ -11,6 +11,9 @@ The primary goal is to **keep the live preview of Typst (and Markdown) documents
 you edit in nvim entirely inside the terminal**. No browser required — every time
 you save, the preview in your terminal updates.
 
+Recent changes are in the
+[CHANGELOG](https://github.com/barewalker/vecview/blob/main/CHANGELOG.md).
+
 ## What makes it different
 
 Most terminal document/image viewers decode a file to a **fixed-resolution
