@@ -1094,6 +1094,11 @@ enum Action {
 /// deadline and never pays for a prefetch between frames.
 const PREFETCH_IDLE: Duration = Duration::from_millis(120);
 
+/// How many pages either side of the current one the idle prefetch warms. At 2 a reader who pauses
+/// between flips stays ahead of a run of flips in either direction; `FrameCache::CAP` is sized to
+/// hold the current page plus this radius on both sides.
+const PREFETCH_RADIUS: usize = 2;
+
 /// Zoom factor (%). The minimum is fit (100), the maximum is 16x.
 const ZOOM_MIN: u32 = 100;
 const ZOOM_MAX: u32 = 1600;
@@ -1745,9 +1750,11 @@ struct FrameCache {
 }
 
 impl FrameCache {
-    /// Keep a handful of pages (current plus a few neighbors). Each entry is a full-resolution RGBA
-    /// buffer, so the cap also bounds memory.
-    const CAP: usize = 5;
+    /// Hold the current page plus `PREFETCH_RADIUS` neighbors on each side, with one slot to spare
+    /// so the page being displayed isn't evicted by the last prefetch of its own neighborhood.
+    /// Each entry is a full-resolution RGBA buffer, so the cap also bounds memory — at 1792x1950
+    /// that's about 14 MB per entry.
+    const CAP: usize = 2 * PREFETCH_RADIUS + 2;
 
     fn get(
         &self,
@@ -1865,12 +1872,16 @@ fn prefetch_one_neighbor(
 ) -> bool {
     let (out_w, out_h) = available_area(backend.name(), state.scale);
     let pages = current_page_count(source, pdf);
+    // Nearest neighbors first, alternating forward and back, so the pages most likely to be asked
+    // for next are warmed by the earliest idle slices.
     let mut targets = Vec::new();
-    if state.page + 1 < pages {
-        targets.push(state.page + 1);
-    }
-    if state.page > 0 {
-        targets.push(state.page - 1);
+    for d in 1..=PREFETCH_RADIUS {
+        if state.page + d < pages {
+            targets.push(state.page + d);
+        }
+        if state.page >= d {
+            targets.push(state.page - d);
+        }
     }
     for p in targets {
         let Some(mt) = page_mtime(source, p) else { continue };
