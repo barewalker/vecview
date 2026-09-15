@@ -23,6 +23,8 @@ pub struct FbInfo {
     pub blue_offset: u32,
     pub transp_offset: u32,
     pub transp_length: u32,
+    /// Length of the mappable video memory in bytes (`fb_fix_screeninfo.smem_len`).
+    pub smem_len: u32,
 }
 
 /// A pure function that writes an RGBA image into `dst` (the framebuffer-equivalent byte slice),
@@ -90,7 +92,18 @@ impl OutputBackend for FramebufferBackend {
 
         let fb = unsafe { read_fb_info(file.as_raw_fd()) }?;
 
-        let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
+        // `/dev/fb0` is a character device whose `st_size` is 0, so mapping without an explicit
+        // length yields an empty map and every pixel would be silently clipped. Map `smem_len`.
+        let len = fb.smem_len as usize;
+        if len < fb.line_length as usize * fb.yres as usize {
+            return Err(anyhow!(
+                "framebuffer memory too small: smem_len={} < {}x{} bytes",
+                len,
+                fb.line_length,
+                fb.yres
+            ));
+        }
+        let mut mmap = unsafe { memmap2::MmapOptions::new().len(len).map_mut(&file)? };
         blit(&mut mmap, rgba, width, height, &fb);
         mmap.flush()?;
         Ok(())
@@ -118,6 +131,7 @@ unsafe fn read_fb_info(fd: std::os::fd::RawFd) -> Result<FbInfo> {
         blue_offset: var.blue.offset,
         transp_offset: var.transp.offset,
         transp_length: var.transp.length,
+        smem_len: fix.smem_len,
     })
 }
 
@@ -208,6 +222,7 @@ mod tests {
             blue_offset: 0,
             transp_offset: 24,
             transp_length: 8,
+            smem_len: line_length * yres,
         }
     }
 

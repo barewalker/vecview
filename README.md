@@ -334,9 +334,10 @@ selection and copy, correct placement within a tmux pane, and handling of window
 switching and multiple instances.
 
 Not yet supported / known limitations: faithful rendering of gradients and clip
-paths, verification of framebuffer output on real hardware, and the stability of
-high-frequency image updates on some terminals (mitigated by the environment
-variables above).
+paths, and the stability of high-frequency image updates on some terminals
+(mitigated by the environment variables above). Framebuffer output has been
+verified on one machine (amdgpu, 3840x2160, 32bpp); other pixel formats are
+untested.
 
 ## License
 

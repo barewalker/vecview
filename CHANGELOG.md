@@ -5,6 +5,17 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Framebuffer output never appeared.** `/dev/fb0` is a character device whose
+  `st_size` is 0, so mapping it without an explicit length produced an empty map
+  and every pixel was silently clipped; no error was reported. The mapping now
+  uses `smem_len` from `FBIOGET_FSCREENINFO`, and a framebuffer smaller than
+  `line_length x yres` is reported instead of ignored. First verified on real
+  hardware (amdgpu, 3840x2160, 32bpp) with this fix.
+
 ## [0.2.0] - 2026-08-08
 
 The headline of this release is that page flips and text selection stopped
