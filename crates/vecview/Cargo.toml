@@ -17,11 +17,11 @@ name = "vv"
 path = "src/main.rs"
 
 [dependencies]
-vecview-core = { path = "../vecview-core", version = "0.2.0" }
-vecview-pdf = { path = "../vecview-pdf", version = "0.2.0" }
-vecview-svg = { path = "../vecview-svg", version = "0.2.0" }
-vecview-renderer = { path = "../vecview-renderer", version = "0.2.0" }
-vecview-output = { path = "../vecview-output", version = "0.2.0" }
+vecview-core = { path = "../vecview-core", version = "0.2.1" }
+vecview-pdf = { path = "../vecview-pdf", version = "0.2.1" }
+vecview-svg = { path = "../vecview-svg", version = "0.2.1" }
+vecview-renderer = { path = "../vecview-renderer", version = "0.2.1" }
+vecview-output = { path = "../vecview-output", version = "0.2.1" }
 clap.workspace = true
 anyhow.workspace = true
 notify.workspace = true
