@@ -35,6 +35,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 icy_sixel = "0.5.0"
+# Opens the pseudo-terminal the idle-CPU test runs `vv` in.
+libc = "0.2"
 
 [features]
 # Pass through to vecview-pdf: embed libpdfium in the binary so `cargo install vecview

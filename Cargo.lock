@@ -2850,6 +2850,7 @@ dependencies = [
  "ctrlc",
  "icy_sixel",
  "image",
+ "libc",
  "notify 8.2.0",
  "notify-debouncer-full",
  "toml",

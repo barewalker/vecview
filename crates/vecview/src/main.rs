@@ -561,10 +561,13 @@ fn main() -> Result<()> {
             }
             // A pending prefetch wakes us a little after the last draw. Held/repeated flips keep
             // arriving faster than this, so they never hit the timeout and never pay for a prefetch.
-            if pending_prefetch && can_attempt_draw {
-                let remaining = last_draw
-                    .map(|t| PREFETCH_IDLE.saturating_sub(Instant::now().duration_since(t)))
-                    .unwrap_or(Duration::ZERO);
+            if let Some(remaining) = prefetch_delay(
+                pending_prefetch,
+                can_attempt_draw,
+                pending_full || pending_overlay,
+                state.help || state.copy.is_some(),
+                last_draw.map(|t| t.elapsed()),
+            ) {
                 w = Some(w.map_or(remaining, |x| x.min(remaining)));
             }
             w
@@ -986,13 +989,14 @@ fn main() -> Result<()> {
         // page. Doing a single page per idle slice is what keeps the loop responsive — a keypress
         // arriving mid-warm waits for one page render, not for the whole neighborhood — and further
         // idle slices finish the rest.
-        if pending_prefetch
-            && !had_input
-            && !pending_full
-            && !pending_overlay
-            && !state.help
-            && state.copy.is_none()
-            && last_draw.is_none_or(|t| Instant::now().duration_since(t) >= PREFETCH_IDLE)
+        if !had_input
+            && prefetch_delay(
+                pending_prefetch,
+                !kitty_ph || was_visible,
+                pending_full || pending_overlay,
+                state.help || state.copy.is_some(),
+                last_draw.map(|t| t.elapsed()),
+            ) == Some(Duration::ZERO)
         {
             pending_prefetch = prefetch_neighbors(
                 &source,
@@ -1225,6 +1229,25 @@ enum Action {
 /// than the throttled flip interval, so a held or repeated page flip keeps arriving before this
 /// deadline and never pays for a prefetch between frames.
 const PREFETCH_IDLE: Duration = Duration::from_millis(120);
+
+/// How long until the idle prefetch may run, or `None` if nothing should wake the loop for it.
+///
+/// This is the single definition shared by the event loop's wait and its prefetch gate. They have to
+/// agree: `Some(ZERO)` makes the wait return immediately, so if the gate then declined to run, nothing
+/// would clear `pending_prefetch` and the loop would spin a full core for as long as that lasted. Any
+/// new reason to hold a prefetch back belongs here, not at either call site.
+fn prefetch_delay(
+    pending_prefetch: bool,
+    can_attempt_draw: bool,
+    draw_pending: bool,
+    modal: bool,
+    since_last_draw: Option<Duration>,
+) -> Option<Duration> {
+    if !pending_prefetch || !can_attempt_draw || draw_pending || modal {
+        return None;
+    }
+    Some(since_last_draw.map_or(Duration::ZERO, |d| PREFETCH_IDLE.saturating_sub(d)))
+}
 
 /// How many pages either side of the current one the idle prefetch warms. At 2 a reader who pauses
 /// between flips stays ahead of a run of flips in either direction; `FrameCache::CAP` is sized to
@@ -3170,11 +3193,12 @@ fn clamp_origin(center: f32, v: f32, p: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_fit, content_bbox, parse_cell_px, parse_key, resolve_scale, viewport_for, Action,
-        Fit, Keymap, ViewState,
+        apply_fit, content_bbox, parse_cell_px, parse_key, prefetch_delay, resolve_scale,
+        viewport_for, Action, Fit, Keymap, ViewState, PREFETCH_IDLE,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::HashMap;
+    use std::time::Duration;
     use vecview_core::{DrawCommand, Page, PathData, PathSegment};
 
     fn key(code: KeyCode, ctrl: bool) -> KeyEvent {
@@ -3395,6 +3419,30 @@ mod tests {
         // center (50,50) -> [25, 25, 50, 50].
         let vp = viewport_for(100.0, 100.0, 1000, 1000, 200, (50.0, 50.0));
         assert_eq!(vp, [25.0, 25.0, 50.0, 50.0]);
+    }
+
+    #[test]
+    fn prefetch_waits_out_the_idle_period_then_runs() {
+        let long_ago = Some(PREFETCH_IDLE * 2);
+        assert_eq!(prefetch_delay(true, true, false, false, None), Some(Duration::ZERO));
+        assert_eq!(prefetch_delay(true, true, false, false, long_ago), Some(Duration::ZERO));
+        let recent = Duration::from_millis(20);
+        assert_eq!(
+            prefetch_delay(true, true, false, false, Some(recent)),
+            Some(PREFETCH_IDLE - recent)
+        );
+    }
+
+    #[test]
+    fn prefetch_never_asks_for_a_wakeup_it_would_not_use() {
+        // Each of these holds the prefetch back. Returning Some(ZERO) for any of them would make the
+        // event loop's wait return at once with nothing to do, spinning a core: help or copy mode
+        // staying open is how that used to happen.
+        let idle = Some(PREFETCH_IDLE * 2);
+        assert_eq!(prefetch_delay(false, true, false, false, idle), None, "nothing pending");
+        assert_eq!(prefetch_delay(true, false, false, false, idle), None, "window hidden");
+        assert_eq!(prefetch_delay(true, true, true, false, idle), None, "draw pending");
+        assert_eq!(prefetch_delay(true, true, false, true, idle), None, "help or copy mode");
     }
 
     #[test]

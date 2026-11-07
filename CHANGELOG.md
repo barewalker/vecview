@@ -5,6 +5,16 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A core stayed pinned while copy mode or help was open.** If a neighbor-page
+  prefetch was still pending, the event loop's wait returned immediately while
+  the prefetch itself was held back, so the loop spun until copy mode or help was
+  closed. Entering copy mode after a zoom, pan or fit (by `y` or a single click)
+  always triggered it for PDFs. The wait and the prefetch now share one condition.
+
 ## [0.2.1] - 2026-09-16
 
 ### Fixed
