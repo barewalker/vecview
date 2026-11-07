@@ -2841,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "vecview"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -2863,7 +2863,7 @@ dependencies = [
 
 [[package]]
 name = "vecview-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "thiserror",
@@ -2871,7 +2871,7 @@ dependencies = [
 
 [[package]]
 name = "vecview-output"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -2885,7 +2885,7 @@ dependencies = [
 
 [[package]]
 name = "vecview-pdf"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "pdfium-bundled",
@@ -2894,7 +2894,7 @@ dependencies = [
 
 [[package]]
 name = "vecview-renderer"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2906,7 +2906,7 @@ dependencies = [
 
 [[package]]
 name = "vecview-svg"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64",
